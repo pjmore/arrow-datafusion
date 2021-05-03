@@ -403,9 +403,9 @@ mod tests {
             let mut state_vec = state_to_vec!(&states[0], Boolean, bool).unwrap();
             state_vec.sort();
             let count = match result {
-                ScalarValue::UInt64(c) => {
-                    c.ok_or_else(|| DataFusionError::Internal("Found None count".to_string()))
-                }
+                ScalarValue::UInt64(c) => c.ok_or_else(|| {
+                    DataFusionError::Internal("Found None count".to_string())
+                }),
                 scalar => Err(DataFusionError::Internal(format!(
                     "Found non Uint64 scalar value from count: {}",
                     scalar
@@ -437,7 +437,7 @@ mod tests {
         assert_eq!(get_count(one_count_values)?, (vec![Some(false)], 1));
         assert_eq!(
             get_count(one_count_values_with_null)?,
-            (vec![Some(false)], 1)
+            (vec![Some(true)], 1)
         );
         assert_eq!(
             get_count(two_count_values)?,

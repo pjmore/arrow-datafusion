@@ -16,23 +16,18 @@
 # under the License.
 
 [package]
-name = "datafusion-examples"
-description = "DataFusion usage examples"
+name = "datafusion-cli"
 version = "4.0.0-SNAPSHOT"
+authors = ["Apache Arrow <dev@arrow.apache.org>"]
+edition = "2018"
+keywords = [ "arrow", "query", "sql", "cli", "repl" ]
+license = "Apache-2.0"
 homepage = "https://github.com/apache/arrow-datafusion"
 repository = "https://github.com/apache/arrow-datafusion"
-authors = ["Apache Arrow <dev@arrow.apache.org>"]
-license = "Apache-2.0"
-keywords = [ "arrow", "query", "sql" ]
-edition = "2018"
-publish = false
 
 
-[dev-dependencies]
-arrow-flight = { git = "https://github.com/apache/arrow-rs", rev = "d008f31b107c1030a1f5144c164e8ca8bf543576" }
-datafusion = { path = "../datafusion" }
-prost = "0.7"
-tonic = "0.4"
+[dependencies]
+clap = "2.33"
+rustyline = "8.0"
 tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread", "sync"] }
-futures = "0.3"
-num_cpus = "1.13.0"
+datafusion = { path = "../datafusion" }

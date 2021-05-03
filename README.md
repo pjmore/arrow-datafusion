@@ -50,7 +50,7 @@ Here are some of the projects known to use DataFusion:
 
 * [Ballista](https://github.com/ballista-compute/ballista) Distributed Compute Platform
 * [Cloudfuse Buzz](https://github.com/cloudfuse-io/buzz-rust)
-* [Cube.js](https://github.com/cube-js/cube.js)
+* [Cube Store](https://github.com/cube-js/cube.js/tree/master/rust)
 * [datafusion-python](https://pypi.org/project/datafusion)
 * [delta-rs](https://github.com/delta-io/delta-rs)
 * [InfluxDB IOx](https://github.com/influxdata/influxdb_iox) Time Series Database
@@ -132,7 +132,7 @@ datafusion = "4.0.0-SNAPSHOT"
 
 ## Using DataFusion as a binary
 
-DataFusion also includes a simple command-line interactive SQL utility. See the [CLI reference](docs/cli.md) for more information.
+DataFusion also includes a simple command-line interactive SQL utility. See the [CLI reference](datafusion/docs/cli.md) for more information.
 
 # Status
 
