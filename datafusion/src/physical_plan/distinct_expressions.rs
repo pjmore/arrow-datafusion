@@ -195,10 +195,7 @@ impl Accumulator for DistinctCountAccumulator {
 mod tests {
     use super::*;
 
-    use arrow::array::{
-        ArrayRef, BooleanArray, Int16Array, Int32Array, Int64Array, Int8Array, ListArray,
-        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
-    };
+    use arrow::array::{ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, ListArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array};
     use arrow::array::{Int32Builder, ListBuilder, UInt64Builder};
     use arrow::datatypes::DataType;
 
@@ -324,7 +321,7 @@ mod tests {
 
         Ok((accum.state()?, accum.evaluate()?))
     }
-
+    
     macro_rules! test_count_distinct_update_batch_numeric {
         ($ARRAY_TYPE:ident, $DATA_TYPE:ident, $PRIM_TYPE:ty) => {{
             let values: Vec<Option<$PRIM_TYPE>> = vec![
@@ -350,6 +347,51 @@ mod tests {
             assert_eq!(states.len(), 1);
             assert_eq!(state_vec, vec![Some(1), Some(2), Some(3)]);
             assert_eq!(result, ScalarValue::UInt64(Some(3)));
+
+            Ok(())
+        }};
+    }
+    
+
+    macro_rules! test_count_distinct_update_batch_floating_point{
+        ($ARRAY_TYPE:ident, $DATA_TYPE:ident, $PRIM_TYPE:ty) => {{
+            use ordered_float::OrderedFloat;
+            let values: Vec<Option<$PRIM_TYPE>> = vec![
+                Some(<$PRIM_TYPE>::INFINITY),
+                Some(<$PRIM_TYPE>::NAN),
+                Some(1.0),
+                Some(1.0),
+                Some(<$PRIM_TYPE>::INFINITY),
+                None,
+                Some(3.0),
+                Some(2.0),
+                None,
+                Some(2.0),
+                Some(3.0),
+                Some(<$PRIM_TYPE>::NEG_INFINITY),
+                Some(1.0),
+                Some(<$PRIM_TYPE>::NAN),
+                Some(<$PRIM_TYPE>::NEG_INFINITY),
+            ];
+
+            let arrays = vec![Arc::new($ARRAY_TYPE::from(values)) as ArrayRef];
+
+            let (states, result) = run_update_batch(&arrays)?;
+
+            let mut state_vec =
+                state_to_vec!(&states[0], $DATA_TYPE, $PRIM_TYPE).unwrap();
+            state_vec.sort_by(|a, b| {
+                match (a,b){
+                    (Some(lhs), Some(rhs))=> OrderedFloat::from(*lhs).cmp(&OrderedFloat::from(*rhs)),
+                    _=> a.partial_cmp(b).unwrap(),
+                }
+            });
+
+            let nan_idx = state_vec.len()-1;
+            assert_eq!(states.len(), 1);
+            assert_eq!(&state_vec[..nan_idx], vec![Some(<$PRIM_TYPE>::NEG_INFINITY),Some(1.0), Some(2.0), Some(3.0),Some(<$PRIM_TYPE>::INFINITY)]);
+            assert!(state_vec[nan_idx].unwrap_or_default().is_nan());
+            assert_eq!(result, ScalarValue::UInt64(Some(6)));
 
             Ok(())
         }};
@@ -393,6 +435,16 @@ mod tests {
     #[test]
     fn count_distinct_update_batch_u64() -> Result<()> {
         test_count_distinct_update_batch_numeric!(UInt64Array, UInt64, u64)
+    }
+
+    #[test]
+    fn count_distinct_update_batch_f32()->Result<()>{
+        test_count_distinct_update_batch_floating_point!(Float32Array, Float32, f32)
+    }
+
+    #[test]
+    fn count_distinct_update_batch_f64()->Result<()>{
+        test_count_distinct_update_batch_floating_point!(Float64Array, Float64, f64)
     }
 
     #[test]
