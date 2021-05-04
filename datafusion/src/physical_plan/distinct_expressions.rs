@@ -357,15 +357,15 @@ mod tests {
     }
 
     //Used trait to create associated constant for f32 and f64
-    trait SubNormal: 'static{
+    trait SubNormal: 'static {
         const SUBNORMAL: Self;
     }
 
-    impl SubNormal for f64{
-        const SUBNORMAL: Self =1.0e-308_f64; 
+    impl SubNormal for f64 {
+        const SUBNORMAL: Self = 1.0e-308_f64;
     }
 
-    impl SubNormal for f32{
+    impl SubNormal for f32 {
         const SUBNORMAL: Self = 1.0e-38_f32;
     }
 
@@ -376,7 +376,7 @@ mod tests {
                 Some(<$PRIM_TYPE>::INFINITY),
                 Some(<$PRIM_TYPE>::NAN),
                 Some(1.0),
-                Some(< $PRIM_TYPE as SubNormal>::SUBNORMAL),
+                Some(<$PRIM_TYPE as SubNormal>::SUBNORMAL),
                 Some(1.0),
                 Some(<$PRIM_TYPE>::INFINITY),
                 None,
@@ -412,7 +412,7 @@ mod tests {
                 vec![
                     Some(<$PRIM_TYPE>::NEG_INFINITY),
                     Some(-4.5),
-                    Some(< $PRIM_TYPE as SubNormal>::SUBNORMAL),
+                    Some(<$PRIM_TYPE as SubNormal>::SUBNORMAL),
                     Some(1.0),
                     Some(2.0),
                     Some(3.0),
