@@ -58,6 +58,7 @@ pin-project-lite= "^0.2.0"
 tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 tokio-stream = "0.1"
 log = "^0.4"
+petgraph = "0.5"
 md-5 = { version = "^0.9.1", optional = true }
 sha2 = { version = "^0.9.1", optional = true }
 ordered-float = "2.0"
