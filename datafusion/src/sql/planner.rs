@@ -463,10 +463,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         ctes: &mut HashMap<String, LogicalPlan>,
     ) -> Result<LogicalPlan> {
         let plans = self.plan_from_tables(&select.from, ctes)?;
-        //println!("The current plans for the select from are: \n" );
-        //for p in plans.iter(){
-        //    println!("+++++++++++++++++++++++++++++++++++++++++\n{:?}\n______________________________________________", p);
-        //}
+
         let plan = match &select.selection {
             Some(predicate_expr) => {
                 // build join schema
@@ -475,135 +472,75 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     fields.extend_from_slice(&plan.schema().fields());
                 }
                 let join_schema = DFSchema::new(fields)?;
-
+            
                 let filter_expr = self.sql_to_rex(predicate_expr, &join_schema)?;
-
+            
                 // look for expressions of the form `<column> = <column>`
                 let mut possible_join_keys = vec![];
                 extract_possible_join_keys(&filter_expr, &mut possible_join_keys)?;
-                
-                let mut all_join_keys = vec![];
-                use petgraph::{Graph, Undirected};
-
-              
-                type GraphType<'a, 'b> = Graph<&'b LogicalPlan, (), Undirected> ;
-                let mut plan_relations : GraphType = Graph::new_undirected();
-                let mut nodes = vec![];
-                for table in plans.iter(){
-                    let new_node = plan_relations.add_node(table);
-                    nodes.push(new_node);
-                }
-                use petgraph::prelude::NodeIndex;
-                //Build the graph of plan join connections
-
-                for (left, left_node_idx) in plans.iter().zip(nodes.iter()){
-                    for ( right,right_node_idx) in plans.iter().zip(nodes.iter()).skip(left_node_idx.index()+1){
-                       let left_schema= left.schema();
-                       let right_schema = right.schema();
-                        for (l, r) in &possible_join_keys {
-                            if left_schema.field_with_unqualified_name(l).is_ok()
-                                && right_schema.field_with_unqualified_name(r).is_ok()
-                            {
-
-                                plan_relations.update_edge(*left_node_idx, *right_node_idx,());
-                                break;
-                            } else if left_schema.field_with_unqualified_name(r).is_ok()
-                                && right_schema.field_with_unqualified_name(l).is_ok()
-                            {
-                                plan_relations.update_edge(*left_node_idx, *right_node_idx,());
-                                break;
-                            }
+            
+            
+                let mut plans_with_hit_counts:Vec<(u32, &LogicalPlan)> = plans.iter().map(|plan|{
+                    let mut key_hit_count = 0;
+                    let schema = plan.schema();
+                    for (l, r) in &possible_join_keys{
+                        if schema.field_with_unqualified_name(l).is_ok()
+                            || schema.field_with_unqualified_name(r).is_ok()
+                        {
+                            key_hit_count +=1;
+                        } 
+                    }
+                    (key_hit_count, plan)
+                }).collect();
+                use std::cmp::Ordering;
+                //Sort the plans so that plans with no hits are located at the beginning, this is so that cross joins are performed early
+                plans_with_hit_counts.sort_by(|a,b| {
+                    match (a.0, b.0){
+                        (0,0) => Ordering::Equal,
+                        (0, _) => Ordering::Less,
+                        (_, 0) => Ordering::Greater,
+                        (a_key, b_key)=> b_key.cmp(&a_key),
+                    }
+                });
+            
+                let mut left = plans_with_hit_counts[0].1.clone();
+                let mut all_join_keys: Vec<(&str, &str)> = vec![];
+                let mut left_join_keys:Vec<&str> = Vec::with_capacity(plans_with_hit_counts.last().unwrap().0 as usize);
+                let mut right_join_keys:Vec<&str> = Vec::with_capacity(plans_with_hit_counts.last().unwrap().0 as usize);
+                for (_, right) in plans_with_hit_counts.into_iter().skip(1){
+                    let left_schema = left.schema();
+                    let right_schema = right.schema();
+                    left_join_keys.clear();
+                    right_join_keys.clear();
+                    for (l, r) in &possible_join_keys{
+                        if left_schema.field_with_unqualified_name(l).is_ok()
+                            && right_schema.field_with_unqualified_name(r).is_ok()
+                        {
+                            left_join_keys.push(l);
+                            right_join_keys.push(r);
+                        } else if left_schema.field_with_unqualified_name(r).is_ok()
+                            && right_schema.field_with_unqualified_name(l).is_ok()
+                        {
+                            left_join_keys.push(r);
+                            right_join_keys.push(l);
                         }
                     }
-                }
-                use petgraph::dot::Dot;
-                //let tr = table_relations.clone();
-                //println!("{:#?}", Dot::with_config(&plan_relations, &[]));
-                use petgraph::algo::tarjan_scc;
-                
-                //petgraph::algo::connected_components(g)
-             
-                
-                let join_relations =tarjan_scc(&plan_relations);
-                
-                let nodes_to_cross_join = join_relations.into_iter().map(|cc| {
-                    let mut min_num_field = usize::MAX;
-                    let mut min_node_idx = NodeIndex::<u32>::new(0);
-                    for node in cc{
-                        let num_fields= plan_relations[node].schema().fields().len();
-                        if num_fields < min_num_field{
-                            min_node_idx = node;
-                            min_num_field = num_fields;
-                        }
-                    }
-                    min_node_idx
-                }).collect::<Vec<_>>();
-                
-                let mut initial_cross_join_plan = plan_relations[nodes_to_cross_join[0]].clone();
-
-                if nodes_to_cross_join.len() != 1{
-                    //If there is more than one connected component cross join on the schema's with the smallest number of fields.
-                    //Create new plan that peforms the cross joins and remove the old plans that were cross joined.
-                    for cross_join_node in nodes_to_cross_join.iter().skip(1){
-                        let right = plan_relations[*cross_join_node];
-                        initial_cross_join_plan = LogicalPlanBuilder::from(&initial_cross_join_plan)
-                            .cross_join(right)?
+                    if left_join_keys.is_empty(){
+                        left =
+                            LogicalPlanBuilder::from(&left).cross_join(right)?.build()?;
+                    }else {
+                        
+                        let builder = LogicalPlanBuilder::from(&left);
+                        left = builder
+                            .join(right, JoinType::Inner, &left_join_keys, &right_join_keys)?
                             .build()?;
+                        all_join_keys.extend(left_join_keys.iter().zip(right_join_keys.iter()).map(|v| (*v.0, *v.1)));
                     }
-                    let cjoined_node = plan_relations.add_node(&initial_cross_join_plan);
-                    
-                    
-                    //For each node that will be cross joined copy its edges to the node with the cross joined plan
-                    //the edges that are copied are marked for removal. 
-                    for cross_join_node in nodes_to_cross_join.iter(){
-                        let  neighbors = plan_relations.neighbors(*cross_join_node).collect::<Vec<_>>();
-                        for n in neighbors{
-                            plan_relations.add_edge(cjoined_node, n, ());
-                        }
-                    }
-                    //Remove all of the edges that were connected to the plans that were cross-joined together
-                    //then remove all nodes with no edges
-                    use std::collections::HashSet;
-                    let  nodes_to_remove: HashSet<NodeIndex<u32>> = nodes_to_cross_join.into_iter().collect();
-                    plan_relations.retain_nodes(|_g, n| {
-                        !nodes_to_remove.contains(&n)
-                    });
-                };
-                //Since all of the nodes remaining in the graph are connected by inner joins visit all plans planning an inner join
-                use petgraph::visit::Dfs;
-                let root= plan_relations.node_indices().next().unwrap();
-                let mut dfs_post = Dfs::new(&plan_relations, root);
-                let left_idx = dfs_post.next(&plan_relations).unwrap();
-                let mut left = plan_relations[left_idx].clone();
-                while let Some(right_idx) = dfs_post.next(&plan_relations){
-                    let right = plan_relations[right_idx];
-                        let left_schema = left.schema();
-                        let right_schema = right.schema();
-                        let mut join_keys = vec![];
-                        for (l, r) in &possible_join_keys {
-                            if left_schema.field_with_unqualified_name(l).is_ok()
-                                && right_schema.field_with_unqualified_name(r).is_ok()
-                            {
-                                join_keys.push((l.as_str(), r.as_str()));
-                            } else if left_schema.field_with_unqualified_name(r).is_ok()
-                                && right_schema.field_with_unqualified_name(l).is_ok()
-                            {
-                                join_keys.push((r.as_str(), l.as_str()));
-                            }
-                        }
-                    let left_keys: Vec<_> =
-                        join_keys.iter().map(|(l, _)| *l).collect();
-                    let right_keys: Vec<_> =
-                        join_keys.iter().map(|(_, r)| *r).collect();
-                    
-                    left = LogicalPlanBuilder::from(&left)
-                            .join(right, JoinType::Inner, &left_keys, &right_keys)?
-                            .build()?;
-
-                    all_join_keys.extend_from_slice(&join_keys);
                 }
             
-                println!("{:#?}", Dot::with_config(&plan_relations, &[]));
+            
+            
+                // remove join expressions from filter
                 match remove_join_expressions(&filter_expr, &all_join_keys)? {
                     Some(filter_expr) => {
                         LogicalPlanBuilder::from(&left).filter(filter_expr)?.build()
