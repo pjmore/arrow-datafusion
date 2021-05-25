@@ -319,7 +319,7 @@ macro_rules! boolean_op {
 
 /// Coercion rules for all binary operators. Returns the output type
 /// of applying `op` to an argument of `lhs_type` and `rhs_type`.
-fn common_binary_type(
+pub fn common_binary_type(
     lhs_type: &DataType,
     op: &Operator,
     rhs_type: &DataType,
@@ -571,8 +571,10 @@ mod tests {
     use arrow::util::display::array_value_to_string;
 
     use super::*;
-    use crate::error::Result;
-    use crate::physical_plan::expressions::col;
+    use crate::{error::Result, logical_plan::DFSchema};
+    use crate::logical_plan::{col, binary_expr, lit};
+    use crate::logical_plan::{ExecutableExpr, ExprExecPreparation};
+    use crate::execution::context::ExecutionProps;
 
     // Create a binary expression without coercion. Used here when we do not want to coerce the expressions
     // to valid types. Usage can result in an execution (after plan) error.
@@ -583,21 +585,30 @@ mod tests {
     ) -> Arc<dyn PhysicalExpr> {
         Arc::new(BinaryExpr::new(l, op, r))
     }
-
+    use std::convert::TryFrom;
     #[test]
     fn binary_comparison() -> Result<()> {
         let schema = Schema::new(vec![
-            Field::new("a", DataType::Int32, false),
+            Field::new("a", DataType::Int16, false),
             Field::new("b", DataType::Int32, false),
         ]);
-        let a = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let a = Int16Array::from(vec![1, 2, 3, 4, 5]);
         let b = Int32Array::from(vec![1, 2, 4, 8, 16]);
         let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a), Arc::new(b)])?;
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a), Arc::new(b)])?;
 
         // expression: "a < b"
-        let lt = binary_simple(col("a"), Operator::Lt, col("b"));
-        let result = lt.evaluate(&batch)?.into_array(batch.num_rows());
+        let lt = binary_expr(col("a"), Operator::Lt, col("b"));
+        let execution_props = ExecutionProps::new();
+
+        let df_schema = Arc::new(DFSchema::try_from(schema.clone())?);
+        let exec_expr = ExecutableExpr::new(&lt, vec![&df_schema], &execution_props)?;
+        println!("The DFSchema is : {:#}", df_schema);
+        for field in df_schema.fields(){
+            println!("{}: {}", field.name(), field.data_type())
+        }
+        println!("The plan for the executable expression is: {}", exec_expr);
+        let result = exec_expr.evaluate(&batch)?.into_array(batch.num_rows());
         assert_eq!(result.len(), 5);
 
         let expected = vec![false, false, true, true, true];
@@ -611,7 +622,7 @@ mod tests {
 
         Ok(())
     }
-
+    
     #[test]
     fn binary_nested() -> Result<()> {
         let schema = Schema::new(vec![
@@ -621,17 +632,16 @@ mod tests {
         let a = Int32Array::from(vec![2, 4, 6, 8, 10]);
         let b = Int32Array::from(vec![2, 5, 4, 8, 8]);
         let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a), Arc::new(b)])?;
+            RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(a), Arc::new(b)])?;
 
         // expression: "a < b OR a == b"
-        let expr = binary_simple(
-            binary_simple(col("a"), Operator::Lt, col("b")),
-            Operator::Or,
-            binary_simple(col("a"), Operator::Eq, col("b")),
-        );
-        assert_eq!("a < b OR a = b", format!("{}", expr));
-
-        let result = expr.evaluate(&batch)?.into_array(batch.num_rows());
+        let lexpr = binary_expr( binary_expr(col("a"), Operator::Lt, col("b")) , Operator::Or, binary_expr(col("a"), Operator::Eq, col("b")));
+        let ctx = ExecutionProps::new();
+        let df_schema =Arc::new( DFSchema::try_from(schema)?);
+        let exec_expr = ExecutableExpr::new(&lexpr, vec![&df_schema],&ctx )?;
+         
+        let result = exec_expr.evaluate(&batch)?.into_array(batch.num_rows());
+        
         assert_eq!(result.len(), 5);
 
         let expected = vec![true, true, false, true, false];
@@ -645,7 +655,7 @@ mod tests {
 
         Ok(())
     }
-
+    /*
     // runs an end-to-end test of physical type coercion:
     // 1. construct a record batch with two columns of type A and B
     //  (*_ARRAY is the Rust Arrow array type, and *_TYPE is the DataType of the elements)
@@ -1098,4 +1108,5 @@ mod tests {
             ))
         }
     }
+    */
 }

@@ -169,7 +169,7 @@ pub fn return_type(fun: &WindowFunction, arg_types: &[DataType]) -> Result<DataT
 }
 
 /// the signatures supported by the function `fun`.
-fn signature(fun: &WindowFunction) -> Signature {
+pub fn signature(fun: &WindowFunction) -> Signature {
     // note: the physical expression must accept the type returned by this function or the execution panics.
     match fun {
         WindowFunction::AggregateFunction(fun) => aggregates::signature(fun),

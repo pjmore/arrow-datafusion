@@ -511,16 +511,9 @@ macro_rules! invoke_if_unicode_expressions_feature_flag {
         }
     };
 }
-
-/// Create a physical (function) expression.
-/// This function errors when `args`' can't be coerced to a valid argument type of the function.
-pub fn create_physical_expr(
-    fun: &BuiltinScalarFunction,
-    args: &[Arc<dyn PhysicalExpr>],
-    input_schema: &Schema,
-    ctx_state: &ExecutionContextState,
-) -> Result<Arc<dyn PhysicalExpr>> {
-    let fun_expr: ScalarFunctionImplementation = Arc::new(match fun {
+///Make a function implementation for the builtin function
+pub fn make_function_impl(fun: &BuiltinScalarFunction, ctx_state: &ExecutionContextState)->Result<ScalarFunctionImplementation>{
+    Ok(Arc::new(match fun {
         // math functions
         BuiltinScalarFunction::Abs => math_expressions::abs,
         BuiltinScalarFunction::Acos => math_expressions::acos,
@@ -617,15 +610,7 @@ pub fn create_physical_expr(
                 ctx_state.execution_props.query_execution_start_time,
             ));
 
-            // TODO refactor code to not return here, but instead fall through below
-            let args = vec![];
-            let arg_types = vec![]; // has no args
-            return Ok(Arc::new(ScalarFunctionExpr::new(
-                &format!("{}", fun),
-                fun_expr,
-                args,
-                &return_type(&fun, &arg_types)?,
-            )));
+           return Ok(fun_expr)
         }
         BuiltinScalarFunction::InitCap => |args| match args[0].data_type() {
             DataType::Utf8 => {
@@ -940,7 +925,19 @@ pub fn create_physical_expr(
             ))),
         },
         BuiltinScalarFunction::Upper => string_expressions::upper,
-    });
+    }))
+}
+
+
+/// Create a physical (function) expression.
+/// This function errors when `args`' can't be coerced to a valid argument type of the function.
+pub fn create_physical_expr(
+    fun: &BuiltinScalarFunction,
+    args: &[Arc<dyn PhysicalExpr>],
+    input_schema: &Schema,
+    ctx_state: &ExecutionContextState,
+) -> Result<Arc<dyn PhysicalExpr>> {
+    let fun_expr: ScalarFunctionImplementation = make_function_impl(&fun, ctx_state)?;
     // coerce
     let args = coerce(args, input_schema, &signature(fun))?;
 
@@ -958,7 +955,7 @@ pub fn create_physical_expr(
 }
 
 /// the signatures supported by the function `fun`.
-fn signature(fun: &BuiltinScalarFunction) -> Signature {
+pub fn signature(fun: &BuiltinScalarFunction) -> Signature {
     // note: the physical expression must accept the type returned by this function or the execution panics.
 
     // for now, the list is small, as we do not have many built-in functions.
@@ -1117,6 +1114,7 @@ pub struct ScalarFunctionExpr {
     args: Vec<Arc<dyn PhysicalExpr>>,
     return_type: DataType,
 }
+
 
 impl Debug for ScalarFunctionExpr {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {

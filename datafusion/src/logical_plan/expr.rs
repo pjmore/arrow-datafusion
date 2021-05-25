@@ -17,6 +17,8 @@
 
 //! This module provides an `Expr` enum for representing expressions
 //! such as `col = 5` or `SUM(col)`. See examples on the [`Expr`] struct.
+mod expr_exec;
+
 
 pub use super::Operator;
 
@@ -36,6 +38,7 @@ use crate::{physical_plan::udaf::AggregateUDF, scalar::ScalarValue};
 use functions::{ReturnTypeFunction, ScalarFunctionImplementation, Signature};
 use std::collections::HashSet;
 
+pub use expr_exec::{ExprExecPreparation, ExecutableExpr};
 /// `Expr` is a central struct of DataFusion's query API, and
 /// represent logical expressions such as `A + 1`, or `CAST(c1 AS
 /// int)`.

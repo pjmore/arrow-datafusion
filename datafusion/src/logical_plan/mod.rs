@@ -47,4 +47,5 @@ pub use operators::Operator;
 pub use plan::{
     JoinType, LogicalPlan, Partitioning, PlanType, PlanVisitor, StringifiedPlan,
 };
+pub use expr::{ExecutableExpr, ExprExecPreparation};
 pub use registry::FunctionRegistry;

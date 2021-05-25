@@ -30,7 +30,7 @@ mod average;
 mod binary;
 mod case;
 mod cast;
-mod coercion;
+pub mod coercion;
 mod column;
 mod count;
 mod in_list;
@@ -44,8 +44,10 @@ mod nullif;
 mod sum;
 mod try_cast;
 
+
+
 pub use average::{avg_return_type, Avg, AvgAccumulator};
-pub use binary::{binary, binary_operator_data_type, BinaryExpr};
+pub use binary::{binary, binary_operator_data_type,common_binary_type, BinaryExpr};
 pub use case::{case, CaseExpr};
 pub use cast::{cast, cast_with_options, CastExpr};
 pub use column::{col, Column};
