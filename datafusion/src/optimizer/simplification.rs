@@ -18,6 +18,7 @@
 //! Expression simplification optimizer.
 //! Rewrites expressions using equivalence rules and the egg optimization library   
 #![allow(dead_code)]
+#![allow(unused_variables)]
 use std::convert::TryFrom;
 use std::fmt::Display;
 use std::str::FromStr;
