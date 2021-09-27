@@ -381,7 +381,7 @@ pub enum ColumnarValue {
 }
 
 impl ColumnarValue {
-    fn data_type(&self) -> DataType {
+    pub(crate) fn data_type(&self) -> DataType {
         match self {
             ColumnarValue::Array(array_value) => array_value.data_type().clone(),
             ColumnarValue::Scalar(scalar_value) => scalar_value.get_datatype(),
@@ -392,6 +392,25 @@ impl ColumnarValue {
         match self {
             ColumnarValue::Array(array) => array,
             ColumnarValue::Scalar(scalar) => scalar.to_array_of_size(num_rows),
+        }
+    }
+    pub(crate) fn try_into_scalar(self)->Option<ScalarValue>{
+        match self{
+            ColumnarValue::Array(a) => if a.len() == 1{
+                ScalarValue::try_from_array(&a,0).ok()
+            }else{
+                None
+            },
+            ColumnarValue::Scalar(s) => Some(s),
+        }
+    }
+}
+
+impl Debug for ColumnarValue{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Array(arg0) => f.debug_tuple("Array").field(arg0).finish(),
+            Self::Scalar(arg0) => f.debug_tuple("Scalar").field(arg0).finish(),
         }
     }
 }

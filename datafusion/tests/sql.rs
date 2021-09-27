@@ -675,6 +675,7 @@ fn create_ctx() -> Result<ExecutionContext> {
         vec![DataType::Float64],
         Arc::new(DataType::Float64),
         Arc::new(custom_sqrt),
+        Default::default()
     ));
 
     Ok(ctx)

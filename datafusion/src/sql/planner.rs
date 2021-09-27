@@ -2856,6 +2856,7 @@ mod tests {
                     vec![DataType::Float64],
                     Arc::new(DataType::Float64),
                     f,
+                    Default::default()
                 ))),
                 _ => None,
             }

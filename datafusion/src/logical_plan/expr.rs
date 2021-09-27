@@ -28,6 +28,7 @@ use arrow::{compute::can_cast_types, datatypes::DataType};
 
 use crate::error::{DataFusionError, Result};
 use crate::logical_plan::{DFField, DFSchema};
+use crate::physical_plan::functions::FunctionVolatility;
 use crate::physical_plan::{
     aggregates, expressions::binary_operator_data_type, functions, udf::ScalarUDF,
     window_functions,
@@ -1170,9 +1171,11 @@ pub fn create_udf(
     input_types: Vec<DataType>,
     return_type: Arc<DataType>,
     fun: ScalarFunctionImplementation,
+    volatility: Option<FunctionVolatility>
 ) -> ScalarUDF {
+    let volatility = volatility.unwrap_or_default();
     let return_type: ReturnTypeFunction = Arc::new(move |_| Ok(return_type.clone()));
-    ScalarUDF::new(name, &Signature::Exact(input_types), &return_type, &fun)
+    ScalarUDF::new(name, &Signature::Exact(input_types), &return_type, &fun, volatility)
 }
 
 /// Creates a new UDAF with a specific signature, state type and return type.

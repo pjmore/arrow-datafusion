@@ -318,6 +318,7 @@ mod tests {
             vec![DataType::Float64],
             Arc::new(DataType::Float64),
             my_fn,
+            Default::default()
         ));
 
         // build query with a UDF using DataFrame API

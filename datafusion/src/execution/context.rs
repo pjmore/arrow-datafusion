@@ -16,17 +16,10 @@
 // under the License.
 
 //! ExecutionContext contains methods for registering data sources and executing queries
-use crate::{
-    catalog::{
+use crate::{catalog::{
         catalog::{CatalogList, MemoryCatalogList},
         information_schema::CatalogWithInformationSchema,
-    },
-    optimizer::{
-        eliminate_limit::EliminateLimit, hash_build_probe_order::HashBuildProbeOrder,
-        simplification::Tokomak,
-    },
-    physical_optimizer::optimizer::PhysicalOptimizerRule,
-};
+    }, optimizer::{eliminate_limit::EliminateLimit, hash_build_probe_order::HashBuildProbeOrder, simplification::Tokomak}, physical_optimizer::optimizer::PhysicalOptimizerRule};
 use log::debug;
 use std::fs;
 use std::path::Path;
@@ -894,7 +887,7 @@ impl FunctionRegistry for ExecutionContextState {
 mod tests {
 
     use super::*;
-    use crate::physical_plan::functions::make_scalar_function;
+    use crate::physical_plan::functions::{FunctionVolatility, make_scalar_function};
     use crate::physical_plan::{collect, collect_partitioned};
     use crate::test;
     use crate::variable::VarType;
@@ -2153,6 +2146,7 @@ mod tests {
             vec![DataType::Int32],
             Arc::new(DataType::Int32),
             myfunc,
+            Option::<FunctionVolatility>::None,
         ));
 
         // doesn't work as it was registered with non lowercase
@@ -2443,6 +2437,7 @@ mod tests {
             vec![DataType::Int32, DataType::Int32],
             Arc::new(DataType::Int32),
             myfunc,
+            Default::default()
         ));
 
         // from here on, we may be in a different scope. We would still like to be able

@@ -114,6 +114,7 @@ async fn main() -> Result<()> {
         // returns f64
         Arc::new(DataType::Float64),
         pow,
+        Default::default(),
     );
 
     // at this point, we can use it or register it, depending on the use-case:

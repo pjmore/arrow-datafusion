@@ -100,16 +100,21 @@ impl PhysicalExpr for CastExpr {
                 )?))
             }
             ColumnarValue::Scalar(scalar) => {
-                let scalar_array = scalar.to_array();
-                let cast_array = kernels::cast::cast_with_options(
-                    &scalar_array,
-                    &self.cast_type,
-                    &self.cast_options,
-                )?;
-                let cast_scalar = ScalarValue::try_from_array(&cast_array, 0)?;
+                let cast_scalar = CastExpr::cast_scalar_type(scalar, &self.cast_type, &self.cast_options)?;
                 Ok(ColumnarValue::Scalar(cast_scalar))
             }
         }
+    }
+}
+
+impl CastExpr{
+    pub(crate) fn cast_scalar_default_options(scalar: ScalarValue, cast_type: &DataType)->Result<ScalarValue>{
+        CastExpr::cast_scalar_type(scalar, cast_type, &DEFAULT_DATAFUSION_CAST_OPTIONS)
+    }
+    pub(crate) fn cast_scalar_type(scalar: ScalarValue, cast_type: &DataType, cast_options: &CastOptions)->Result<ScalarValue>{
+        let scalar_array = scalar.to_array();
+        let cast_array = kernels::cast::cast_with_options(&scalar_array, cast_type, cast_options)?;
+        ScalarValue::try_from_array(&cast_array, 0)
     }
 }
 
