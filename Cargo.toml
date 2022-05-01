@@ -36,5 +36,5 @@ members = [
 exclude = ["datafusion-cli"]
 
 [profile.release]
-codegen-units = 1
-lto = true
+#codegen-units = 1
+lto ="thin"
