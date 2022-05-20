@@ -28,7 +28,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{
     ArrowDictionaryKeyType, ArrowNativeType, DataType, Int16Type, Int32Type, Int64Type,
-    Int8Type, TimeUnit, UInt16Type, UInt32Type, UInt64Type, UInt8Type, ArrowPrimitiveType, Date64Type, Date32Type, Float32Type, Float64Type, TimestampSecondType, TimestampMillisecondType, TimestampMicrosecondType, TimestampNanosecondType,
+    Int8Type, TimeUnit, UInt16Type, UInt32Type, UInt64Type, UInt8Type, ArrowPrimitiveType,  Float32Type, Float64Type,
 };
 use std::sync::Arc;
 
@@ -111,46 +111,51 @@ macro_rules! hash_array {
     };
 }
 
-pub(crate) fn hash_decimal128_new<'a, const N: usize, const FIRST_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32){
-    assert!(num_to_process <= N);
+pub(crate) fn hash_decimal128_new<const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32){
+    assert!(num_to_process <= N as u32);
     let array = column.as_any().downcast_ref::<DecimalArray>().unwrap();
-    assert!(start_idx + num_to_process <= array.len());
+    assert!(start_idx + num_to_process <= array.len().try_into().unwrap());
     if array.null_count() == 0 {
         let mut arr_idx = start_idx;
         for offset in 0..num_to_process{
-            if arr_idx >= array.len(){
+            if arr_idx as usize >= array.len(){
                 //Since the decimal array doesn't have value_unchecked use hint instead
                 unsafe{std::hint::unreachable_unchecked()};
             }
-            let value = array.value(arr_idx);
+            let value = array.value(arr_idx as usize);
             let new_hash = i128::get_hash(&value, random_state);
-            *unsafe{hashes.get_unchecked_mut(offset)} = if FIRST_COL{
+            
+            *unsafe{hashes.get_unchecked_mut(offset as usize)} = if FIRST_COL && MULTI_COL{
+                combine_hashes(new_hash, 0)
+            }else if FIRST_COL && !MULTI_COL{
                 new_hash
             }else{
-                combine_hashes(new_hash, *unsafe{hashes.get_unchecked(offset)})
+                combine_hashes(new_hash, *unsafe{hashes.get_unchecked(offset as usize)})
             };
             arr_idx +=1;
         }
     } else {
         let mut arr_idx = start_idx;
         for offset in 0..num_to_process{
-            if arr_idx >= array.len(){
+            if arr_idx as usize >= array.len(){
                 //Since the decimal array doesn't have value_unchecked use hint instead
                 unsafe{std::hint::unreachable_unchecked()};
             }
             //If this is the first column set the index to 0 to avoid reusing hash values already in the buffer 
-            if array.is_null(arr_idx){
+            if array.is_null(arr_idx as usize){
                 if FIRST_COL{
-                    *unsafe{hashes.get_unchecked_mut(offset)} =  0;
+                    *unsafe{hashes.get_unchecked_mut(offset as usize)} =  0;
                 }
                 continue;
             }
-            let value = array.value(arr_idx);
+            let value = array.value(arr_idx as usize);
             let new_hash = i128::get_hash(&value, random_state);
-            *unsafe{hashes.get_unchecked_mut(offset)} = if FIRST_COL{
+            *unsafe{hashes.get_unchecked_mut(offset as usize)} = if FIRST_COL && MULTI_COL{
+                combine_hashes(new_hash, 0)
+            }else if FIRST_COL && !MULTI_COL{
                 new_hash
             }else{
-                combine_hashes(new_hash, *unsafe{hashes.get_unchecked(offset)})
+                combine_hashes(new_hash, *unsafe{hashes.get_unchecked(offset as usize)})
             };
             arr_idx +=1;
         }
@@ -158,47 +163,51 @@ pub(crate) fn hash_decimal128_new<'a, const N: usize, const FIRST_COL: bool>(col
 }
 
 
-pub (crate) fn hash_array<ARR: 'static, IsNull: Fn(&ARR, usize)->bool + 'static + Copy, GetHash: Fn(&ARR, &RandomState, usize)->u64, const N: usize, const FIRST_COL: bool>(column: &dyn Array,hashes: &mut [u64; N], random_state: &RandomState, start_idx: usize, num_to_process: usize, is_null: IsNull, get_hash: GetHash){
+pub (crate) fn hash_array<ARR: 'static, IsNull: Fn(&ARR, usize)->bool + 'static + Copy, GetHash: Fn(&ARR, &RandomState, usize)->u64, const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(column: &dyn Array,hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32, is_null: IsNull, get_hash: GetHash){
     let null_count = column.null_count();
     let arr = column.as_any().downcast_ref::<ARR>().unwrap();
-    assert!(num_to_process <= N);
-    assert!(start_idx + num_to_process <= column.len());
+    assert!(num_to_process as usize <= N);
+    assert!((start_idx + num_to_process) as usize <= column.len());
     if null_count == 0{
         for offset in 0..num_to_process{
-            *unsafe{hashes.get_unchecked_mut(offset)} = {
-                let new_hash = get_hash(arr, random_state, start_idx + offset);
-                if FIRST_COL{
+            *unsafe{hashes.get_unchecked_mut(offset as usize)} = {
+                let new_hash = get_hash(arr, random_state, (start_idx + offset) as usize);
+                if FIRST_COL && MULTI_COL{
+                    combine_hashes(new_hash, 0)
+                }else if FIRST_COL && !MULTI_COL {
                     new_hash
                 }else{
-                    combine_hashes(new_hash, *unsafe{hashes.get_unchecked(offset)})
+                    combine_hashes(new_hash, *unsafe{hashes.get_unchecked(offset  as usize)})
                 }
             }
         }
     }else{
         for offset in 0..num_to_process{
             let idx = start_idx + offset;
-            let old_hash = *unsafe{hashes.get_unchecked(offset)};
+            let old_hash = *unsafe{hashes.get_unchecked(offset as usize)};
             //If first column is null then fill with 0
-            *unsafe{hashes.get_unchecked_mut(offset)} = if FIRST_COL && is_null(arr, idx){
+            *unsafe{hashes.get_unchecked_mut(offset as usize)} = if FIRST_COL && is_null(arr, idx as usize){
                 0
-            }else if is_null(arr, idx){
+            }else if is_null(arr, idx as usize){
                 //If other column is null do not modify hash. Done this way to encourage conditional move instructions
                 old_hash
             }else{
                 //If value is not null calculate has normally
-                let new_hash = get_hash(arr,random_state, start_idx + offset);
-                if FIRST_COL{
+                let new_hash = get_hash(arr,random_state, (start_idx + offset)  as usize);
+                if FIRST_COL && MULTI_COL{
+                    combine_hashes(new_hash, 0)
+                }else if FIRST_COL && !MULTI_COL {
                     new_hash
                 }else{
-                    combine_hashes(new_hash, old_hash)
+                    combine_hashes(new_hash, *unsafe{hashes.get_unchecked(offset  as usize)})
                 }
             };
         }
     }
 }
 
-pub (crate) fn hash_array_boolean<const N: usize, const FIRST_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: usize, num_to_process: usize){
-    hash_array::<BooleanArray, _, _, N, FIRST_COL>(column, hashes, random_state, start_idx, num_to_process, 
+pub (crate) fn hash_array_boolean<const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32){
+    hash_array::<BooleanArray, _, _, N, FIRST_COL, MULTI_COL>(column, hashes, random_state, start_idx, num_to_process, 
         |arr, idx|  arr.is_null(idx),
         |arr, r, idx| {
             let value = unsafe{arr.value_unchecked(idx)} as u8;
@@ -207,8 +216,8 @@ pub (crate) fn hash_array_boolean<const N: usize, const FIRST_COL: bool>(column:
     )
 }
 
-pub (crate) fn hash_array_utf8<StringIndexType: StringOffsetSizeTrait,const N: usize, const FIRST_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: usize, num_to_process: usize){
-    hash_array::<GenericStringArray<StringIndexType>, _, _, N, FIRST_COL>(column, hashes, random_state, start_idx, num_to_process, 
+pub (crate) fn hash_array_utf8<StringIndexType: StringOffsetSizeTrait,const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32){
+    hash_array::<GenericStringArray<StringIndexType>, _, _, N, FIRST_COL, MULTI_COL>(column, hashes, random_state, start_idx, num_to_process, 
         |arr, idx|  arr.is_null(idx),
         |arr, r, idx| {
             let value = unsafe{arr.value_unchecked(idx)};
@@ -217,61 +226,61 @@ pub (crate) fn hash_array_utf8<StringIndexType: StringOffsetSizeTrait,const N: u
     )
 }
 
-pub(crate) fn hash_array_primitive<T: ArrowPrimitiveType, const N: usize, const FIRST_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: usize, num_to_process: usize)
+pub(crate) fn hash_array_primitive<T: ArrowPrimitiveType, const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32)
 where T::Native: std::hash::Hash{
-    hash_array_native::<T, _, N, FIRST_COL>(column, hashes, random_state, start_idx, num_to_process, |val, r| <T as ArrowPrimitiveType>::Native::get_hash(&val, r))
+    hash_array_native::<T, _, N, FIRST_COL, MULTI_COL>(column, hashes, random_state, start_idx, num_to_process, |val, r| <T as ArrowPrimitiveType>::Native::get_hash(&val, r))
 }
 
-pub (crate) fn hash_f64_array<const N: usize, const FIRST_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: usize, num_to_process: usize){
-    hash_array_native::<Float64Type,_, N, FIRST_COL>(column, hashes, random_state, start_idx, num_to_process, |val, r| {
+pub (crate) fn hash_f64_array<const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32){
+    hash_array_native::<Float64Type,_, N, FIRST_COL, MULTI_COL>(column, hashes, random_state, start_idx, num_to_process, |val, r| {
         let v = u64::from_ne_bytes(val.to_ne_bytes());
         let hash = <UInt64Type as ArrowPrimitiveType>::Native::get_hash(&v, r);
         hash
     })
 }
 
-pub (crate) fn hash_f32_array<const N: usize, const FIRST_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: usize, num_to_process: usize){
-    hash_array_native::<Float32Type,_, N, FIRST_COL>(column, hashes, random_state, start_idx, num_to_process, |val, r| {
+pub (crate) fn hash_f32_array<const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32){
+    hash_array_native::<Float32Type,_, N, FIRST_COL, MULTI_COL>(column, hashes, random_state, start_idx, num_to_process, |val, r| {
         let v = u32::from_ne_bytes(val.to_ne_bytes());
         let hash = <UInt32Type as ArrowPrimitiveType>::Native::get_hash(&v, r);
         hash
     })
 }
 
-pub (crate) fn hash_array_native<T: ArrowPrimitiveType, HashVal: Fn(T::Native, &RandomState)->u64 +'static + Copy,const N: usize, const FIRST_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: usize, num_to_process: usize, hash_value: HashVal ){
-   
-    
+pub (crate) fn hash_array_native<T: ArrowPrimitiveType, HashVal: Fn(T::Native, &RandomState)->u64 +'static + Copy,const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32, hash_value: HashVal ){
     let array = column.as_any().downcast_ref::<PrimitiveArray<T>>().unwrap();
-    assert!(num_to_process <= N);
-    
-    assert!(start_idx + num_to_process <= array.len());
+    assert!(num_to_process as usize <= N);
+    //println!("ISFIRST: {}", FIRST_COL);
+    //println!("BEFORE: {:?}", &hashes[0..(num_to_process as usize)]);
+
+    assert!((start_idx + num_to_process) as usize <= array.len());
     if array.null_count() == 0{
         let values = array.values();
         for offset in 0..num_to_process{
-            *unsafe{hashes.get_unchecked_mut(offset)} = {
-                //SAFETY: Since num_to_process > offset and array.len() >= start_idx + num_to_process this will always be withing bounds
-                let value = *unsafe{values.get_unchecked(start_idx + offset)};
-                let new_hash = hash_value(value, random_state);
-                if FIRST_COL{
-                    new_hash
-                }else{
-                    combine_hashes(new_hash, *unsafe{hashes.get_unchecked(offset)})
-                }
-            }
+            //SAFETY: Since num_to_process > offset and array.len() >= start_idx + num_to_process this will always be withing bounds
+            let value = values[(start_idx + offset) as usize];
+            let new_hash = hash_value(value, random_state);
+            hashes[offset as usize]  = if FIRST_COL && MULTI_COL{
+                combine_hashes(new_hash, 0)
+            }else if FIRST_COL && !MULTI_COL{
+                new_hash
+            }else{
+                combine_hashes(new_hash, hashes[offset as usize])
+            };
         }
     }else{
         for offset in 0..num_to_process{
             let idx = start_idx + offset;
-            let old_hash = *unsafe{hashes.get_unchecked(offset)};
+            let old_hash = *unsafe{hashes.get_unchecked(offset as usize)};
             //If first column is null then fill with 0
-            *unsafe{hashes.get_unchecked_mut(offset)} = if FIRST_COL && array.is_null(idx){
+            hashes[offset as usize] = if FIRST_COL && array.is_null(idx as usize){
                 0
-            }else if array.is_null(idx){
+            }else if array.is_null(idx as usize){
                 //If other column is null do not modify hash. Done this way to encourage conditional move instructions
                 old_hash
             }else{
                 //If value is not null calculate has normally
-                let value = unsafe{array.value_unchecked(idx)};
+                let value = array.value((start_idx + offset) as usize);
                 let new_hash = hash_value(value, random_state);
                 if FIRST_COL{
                     new_hash
@@ -281,7 +290,133 @@ pub (crate) fn hash_array_native<T: ArrowPrimitiveType, HashVal: Fn(T::Native, &
             };
         }
     }
+    //println!("AFTER: {:?}", &hashes[0..(num_to_process  as usize)]);
+    
 }
+
+
+fn process_hashes<const N: usize, const FIRST_COL: bool, const MULTI_COL: bool>(chunk: &mut [u64], local_buffer: &[u64; N]){
+    assert!(N == chunk.len());
+    for i in 0..N{
+        chunk[i] = match (FIRST_COL, MULTI_COL){
+            (true, true) => combine_hashes(local_buffer[i], 0),
+            (false, true)=> combine_hashes(local_buffer[i], chunk[i]),
+            _=> local_buffer[i],
+        };
+    }
+    
+}
+
+
+macro_rules! hash_array_new_primitive{
+    (DECLARE: $func_name:ident,$array_type:ident, $ty:ident)=>{
+        fn $func_name<const N: usize, const FIRST_COL: bool, const MULTI_COL: bool, const FULL_RUN: bool> (column: &dyn Array, hashes: &mut [u64; N], random_state: &RandomState, start_idx: u32, num_to_process: u32){
+            let array = column.as_any().downcast_ref::<$array_type>().unwrap();
+            const INTERNAL_HASH_BUFFER_SIZE: usize = 16;
+            const INTERNAL_HASH_BUFFER_SIZE_U32: u32 = INTERNAL_HASH_BUFFER_SIZE as u32;
+            let mut hash_buffer = [0u64; INTERNAL_HASH_BUFFER_SIZE];
+            let mut offset = start_idx;
+            let num_to_process = if FULL_RUN{
+                N as u32
+            }else{
+                num_to_process
+            };
+            let mut mut_chunks = (&mut hashes[..(num_to_process as usize)]).chunks_exact_mut(INTERNAL_HASH_BUFFER_SIZE);
+            //println!("start_idx: {start_idx}, end: {end}, end_iter: {end_iter}, num_to_process: {num_to_process}, INTERNAL_BUF_SIZE: {INTERNAL_HASH_BUFFER_SIZE}, N:{N}");
+            if array.null_count() == 0{
+                    for chunk in &mut mut_chunks{
+                        //println!("Processing from {} to {} of size {} from len:{}", offset, offset+INTERNAL_HASH_BUFFER_SIZE_U32, chunk.len(), array.len());
+                        for i in 0..INTERNAL_HASH_BUFFER_SIZE{
+                            let value = $ty::from_ne_bytes(array.value(offset as usize + i).to_ne_bytes());
+                            hash_buffer[i as usize] = $ty::get_hash(&value, random_state);
+                        }
+                        for i in 0..INTERNAL_HASH_BUFFER_SIZE{
+
+                            chunk[i] = match (FIRST_COL, MULTI_COL){
+                                (true, true) => combine_hashes(hash_buffer[i], 0),
+                                (false, true)=> combine_hashes(hash_buffer[i], chunk[i]),
+                                (_, false) => hash_buffer[i],
+                            };
+                            //println!("Set hash at idx {} to {}", idx_base+ i, chunk[i] );
+                        }
+                        offset+=INTERNAL_HASH_BUFFER_SIZE_U32;
+                        //idx_base += INTERNAL_HASH_BUFFER_SIZE;
+                    }
+                    //println!("Offset: {offset}");
+                    for hash in mut_chunks.into_remainder().iter_mut(){
+                        let value =  $ty::from_ne_bytes(array.value(offset as usize).to_ne_bytes());
+                        let new_hash = $ty::get_hash(&value, random_state);
+                        *hash = match (FIRST_COL, MULTI_COL){
+                            (true, true) => combine_hashes(new_hash, 0),
+                            (false, true)=> combine_hashes(new_hash, *hash),
+                            (_, false)=> new_hash,
+                        };
+                        //println!("Set hash at idx {} to {}", idx_base, *hash );
+
+                        offset +=1;
+                        //idx_base +=1;
+                    }
+                
+                
+
+            }else{
+                for chunk in &mut mut_chunks{
+                    for i in 0..INTERNAL_HASH_BUFFER_SIZE{
+                        let arr_idx = offset as usize + i;
+                        let value = $ty::from_ne_bytes(array.value(arr_idx).to_ne_bytes());
+                        hash_buffer[i] = if array.is_null(arr_idx){
+                            u64::MAX                           
+                        }else{
+                            $ty::get_hash(&value, random_state)
+                        };
+                    }
+                    for i in 0..INTERNAL_HASH_BUFFER_SIZE{
+                        chunk[i] = match (FIRST_COL, MULTI_COL){
+                            (true, true) => combine_hashes(hash_buffer[i], 0),
+                            (false, true)=> combine_hashes(hash_buffer[i], chunk[i]),
+                            _=> chunk[i],
+                        };
+                    }
+                    offset+=INTERNAL_HASH_BUFFER_SIZE_U32;
+                }
+                for hash in mut_chunks.into_remainder().iter_mut(){
+                    
+                    let arr_idx = offset as usize;
+                    if !array.is_null(arr_idx) {
+                        let value = $ty::from_ne_bytes(array.value(arr_idx).to_ne_bytes());
+                        let new_hash = $ty::get_hash(&value, random_state);
+                        *hash = match (FIRST_COL, MULTI_COL){
+                            (true, true) => combine_hashes(new_hash, 0),
+                            (false, true)=> combine_hashes(new_hash, *hash),
+                            _=> *hash,
+                        };
+                    }
+                    offset +=1;
+                }
+            }
+        }
+    }
+}
+hash_array_new_primitive!(DECLARE: hash_uint8_array, UInt8Array, u8);
+hash_array_new_primitive!(DECLARE: hash_uint16_array, UInt16Array, u16);
+hash_array_new_primitive!(DECLARE: hash_uint32_array, UInt32Array, u32);
+hash_array_new_primitive!(DECLARE: hash_uint64_array, UInt64Array, u64);
+hash_array_new_primitive!(DECLARE: hash_int8_array, Int8Array, i8);
+hash_array_new_primitive!(DECLARE: hash_int16_array, Int16Array, i16);
+hash_array_new_primitive!(DECLARE: hash_int32_array, Int32Array, i32);
+hash_array_new_primitive!(DECLARE: hash_int64_array, Int64Array, i64);
+hash_array_new_primitive!(DECLARE: hash_float64_array, Float64Array, u64);
+hash_array_new_primitive!(DECLARE: hash_float32_array, Float32Array, u32);
+hash_array_new_primitive!(DECLARE: hash_decimal, DecimalArray, i128);
+hash_array_new_primitive!(DECLARE: hash_date32_array, Date32Array, i32);
+hash_array_new_primitive!(DECLARE: hash_date64_array, Date64Array, i64);
+hash_array_new_primitive!(DECLARE: hash_time_s_array, TimestampSecondArray, i64);
+hash_array_new_primitive!(DECLARE: hash_time_ms_array, TimestampMillisecondArray, i64);
+hash_array_new_primitive!(DECLARE: hash_time_us_array, TimestampMicrosecondArray, i64);
+hash_array_new_primitive!(DECLARE: hash_time_ns_array, TimestampNanosecondArray, i64);
+
+
+
 
 
 
@@ -447,43 +582,65 @@ pub fn create_hashes<'a>(
 }
 
 pub (crate) fn create_hashes_new<const N: usize>(arrays: &[ArrayRef], random_state: &RandomState, hashes_buffer: &mut[u64; N], start_idx: u32, num_to_process: u32)->Result<()>{
-    hash_column::<N, true>(&arrays[0], random_state, hashes_buffer, start_idx, num_to_process)?;
-    for col in arrays.iter().skip(1){
-        hash_column::<N, false>(col, random_state, hashes_buffer, start_idx, num_to_process)?;
+    if num_to_process == (N as u32){
+        if arrays.len() == 1{
+            hash_column::<N, true, false, true>(&arrays[0], random_state, hashes_buffer, start_idx, num_to_process)?;
+        }else{
+            hash_column::<N, true, true, true>(&arrays[0], random_state, hashes_buffer, start_idx, num_to_process)?;
+            for col in arrays.iter().skip(1){
+                hash_column::<N, false, true, true>(&col, random_state, hashes_buffer, start_idx, num_to_process)?;
+            }
+        }
+    }else{
+        if arrays.len() == 1{
+            hash_column::<N, true, false, false>(&arrays[0], random_state, hashes_buffer, start_idx, num_to_process)?;
+        }else{
+            hash_column::<N, true, true, false>(&arrays[0], random_state, hashes_buffer, start_idx, num_to_process)?;
+            for col in arrays.iter().skip(1){
+                hash_column::<N, false, true, false>(&col, random_state, hashes_buffer, start_idx, num_to_process)?;
+            }
+        }
     }
+    
     Ok(())
 }
 
-fn hash_column<const N: usize, const FIRST_COL: bool>(col: &ArrayRef, random_state: &RandomState, hashes_buffer: &mut[u64; N], start_idx: u32, num_to_process: u32)->Result<()>{
+fn hash_column<const N: usize, const FIRST_COL: bool, const MULTI_COL: bool, const FULL_RUN: bool>(col: &ArrayRef, random_state: &RandomState, hashes_buffer: &mut[u64; N], start_idx: u32, num_to_process: u32)->Result<()>{
     // combine hashes with `combine_hashes` if we have more than 1 column
+    let num_to_process = if FULL_RUN{
+        N as u32
+    }else{
+        num_to_process
+    };
     let col = col.as_ref();
-    if num_to_process > N{
+    if num_to_process as usize > N{
         return Err(DataFusionError::Internal(format!("Attempted to process more than {} elements at once, exceeded buffer length {}.", num_to_process, N)));
     }
-    if num_to_process > N{
+    if num_to_process as usize > N{
         unsafe{std::hint::unreachable_unchecked()};
     }
+    let t = true;
     match col.data_type() {
-        DataType::Decimal(_, _) => hash_decimal128_new::<N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::UInt8 => hash_array_primitive::<UInt8Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::UInt16 =>  hash_array_primitive::<UInt16Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::UInt32 =>  hash_array_primitive::<UInt32Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::UInt64 =>  hash_array_primitive::<UInt64Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Int8 =>  hash_array_primitive::<Int8Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Int16 =>  hash_array_primitive::<Int16Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Int32 =>  hash_array_primitive::<Int32Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Int64 =>  hash_array_primitive::<Int64Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Float32 =>  hash_f32_array::<N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Float64 =>  hash_f64_array::<N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Timestamp(TimeUnit::Second, None) => hash_array_primitive::<TimestampSecondType, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Timestamp(TimeUnit::Millisecond, None) =>  hash_array_primitive::<TimestampMillisecondType, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Timestamp(TimeUnit::Microsecond, None) =>  hash_array_primitive::<TimestampMicrosecondType, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) =>  hash_array_primitive::<TimestampNanosecondType, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Date32 =>  hash_array_primitive::<Date32Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Date64 =>  hash_array_primitive::<Date64Type, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Boolean => hash_array_boolean::<N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::Utf8 => hash_array_utf8::<i32, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
-        DataType::LargeUtf8 => hash_array_utf8::<i64, N, FIRST_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Decimal(_, _) => hash_decimal::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::UInt8 => hash_uint8_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::UInt16 =>  hash_uint16_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::UInt32 =>  hash_uint32_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::UInt64 =>  hash_uint64_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Int8 =>  hash_int8_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Int16 =>  hash_int16_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Int32 =>  hash_int32_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Int64 =>  hash_int64_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Float32 =>  hash_float32_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Float64 =>  hash_float64_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Timestamp(TimeUnit::Second, None) => hash_time_s_array::< N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Timestamp(TimeUnit::Millisecond, None) =>  hash_time_ms_array::< N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Timestamp(TimeUnit::Microsecond, None) =>  hash_time_us_array::< N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) =>  hash_time_ns_array::<N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Date32 =>  hash_date32_array::< N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Date64 =>  hash_date64_array::< N, FIRST_COL, MULTI_COL, FULL_RUN>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Boolean => hash_array_boolean::<N, FIRST_COL, MULTI_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::Utf8 => hash_array_utf8::<i32, N, FIRST_COL, MULTI_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
+        DataType::LargeUtf8 => hash_array_utf8::<i64, N, FIRST_COL, MULTI_COL>(col, hashes_buffer, random_state, start_idx, num_to_process),
         /*DataType::Dictionary(index_type, _) => match **index_type {
             DataType::Int8 => {
                 create_hashes_dictionary::<Int8Type>(
@@ -567,6 +724,8 @@ fn hash_column<const N: usize, const FIRST_COL: bool>(col: &ArrayRef, random_sta
     Ok(()) 
 }
 
+
+
 /// Creates hash values for every row, based on the values in the
 /// columns.
 ///
@@ -578,285 +737,24 @@ pub fn create_hashes<'a>(
     random_state: &RandomState,
     hashes_buffer: &'a mut Vec<u64>,
 ) -> Result<&'a mut Vec<u64>> {
-    // combine hashes with `combine_hashes` if we have more than 1 column
-    let multi_col = arrays.len() > 1;
-
-    for col in arrays {
-        match col.data_type() {
-            DataType::Decimal(_, _) => {
-                hash_decimal128(col, random_state, hashes_buffer, multi_col);
-            }
-            DataType::UInt8 => {
-                hash_array_primitive!(
-                    UInt8Array,
-                    col,
-                    u8,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::UInt16 => {
-                hash_array_primitive!(
-                    UInt16Array,
-                    col,
-                    u16,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::UInt32 => {
-                hash_array_primitive!(
-                    UInt32Array,
-                    col,
-                    u32,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::UInt64 => {
-                hash_array_primitive!(
-                    UInt64Array,
-                    col,
-                    u64,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Int8 => {
-                hash_array_primitive!(
-                    Int8Array,
-                    col,
-                    i8,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Int16 => {
-                hash_array_primitive!(
-                    Int16Array,
-                    col,
-                    i16,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Int32 => {
-                hash_array_primitive!(
-                    Int32Array,
-                    col,
-                    i32,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Int64 => {
-                hash_array_primitive!(
-                    Int64Array,
-                    col,
-                    i64,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Float32 => {
-                hash_array_float!(
-                    Float32Array,
-                    col,
-                    u32,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Float64 => {
-                hash_array_float!(
-                    Float64Array,
-                    col,
-                    u64,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Timestamp(TimeUnit::Second, None) => {
-                hash_array_primitive!(
-                    TimestampSecondArray,
-                    col,
-                    i64,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Timestamp(TimeUnit::Millisecond, None) => {
-                hash_array_primitive!(
-                    TimestampMillisecondArray,
-                    col,
-                    i64,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Timestamp(TimeUnit::Microsecond, None) => {
-                hash_array_primitive!(
-                    TimestampMicrosecondArray,
-                    col,
-                    i64,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                hash_array_primitive!(
-                    TimestampNanosecondArray,
-                    col,
-                    i64,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Date32 => {
-                hash_array_primitive!(
-                    Date32Array,
-                    col,
-                    i32,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Date64 => {
-                hash_array_primitive!(
-                    Date64Array,
-                    col,
-                    i64,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Boolean => {
-                hash_array!(
-                    BooleanArray,
-                    col,
-                    u8,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Utf8 => {
-                hash_array!(
-                    StringArray,
-                    col,
-                    str,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::LargeUtf8 => {
-                hash_array!(
-                    LargeStringArray,
-                    col,
-                    str,
-                    hashes_buffer,
-                    random_state,
-                    multi_col
-                );
-            }
-            DataType::Dictionary(index_type, _) => match **index_type {
-                DataType::Int8 => {
-                    create_hashes_dictionary::<Int8Type>(
-                        col,
-                        random_state,
-                        hashes_buffer,
-                        multi_col,
-                    )?;
-                }
-                DataType::Int16 => {
-                    create_hashes_dictionary::<Int16Type>(
-                        col,
-                        random_state,
-                        hashes_buffer,
-                        multi_col,
-                    )?;
-                }
-                DataType::Int32 => {
-                    create_hashes_dictionary::<Int32Type>(
-                        col,
-                        random_state,
-                        hashes_buffer,
-                        multi_col,
-                    )?;
-                }
-                DataType::Int64 => {
-                    create_hashes_dictionary::<Int64Type>(
-                        col,
-                        random_state,
-                        hashes_buffer,
-                        multi_col,
-                    )?;
-                }
-                DataType::UInt8 => {
-                    create_hashes_dictionary::<UInt8Type>(
-                        col,
-                        random_state,
-                        hashes_buffer,
-                        multi_col,
-                    )?;
-                }
-                DataType::UInt16 => {
-                    create_hashes_dictionary::<UInt16Type>(
-                        col,
-                        random_state,
-                        hashes_buffer,
-                        multi_col,
-                    )?;
-                }
-                DataType::UInt32 => {
-                    create_hashes_dictionary::<UInt32Type>(
-                        col,
-                        random_state,
-                        hashes_buffer,
-                        multi_col,
-                    )?;
-                }
-                DataType::UInt64 => {
-                    create_hashes_dictionary::<UInt64Type>(
-                        col,
-                        random_state,
-                        hashes_buffer,
-                        multi_col,
-                    )?;
-                }
-                _ => {
-                    return Err(DataFusionError::Internal(format!(
-                        "Unsupported dictionary type in hasher hashing: {}",
-                        col.data_type(),
-                    )))
-                }
-            },
-            _ => {
-                // This is internal because we should have caught this before.
-                return Err(DataFusionError::Internal(format!(
-                    "Unsupported data type in hasher: {}",
-                    col.data_type()
-                )));
-            }
+    const BUF_SIZE: usize = 1024;
+    let mut buffer = [0u64;BUF_SIZE];
+    let mut offset = 0;
+    let len = arrays[0].len();
+    while offset + BUF_SIZE < len{
+        create_hashes_new(arrays, random_state, &mut buffer,offset as u32, BUF_SIZE as u32)?;
+        for i in 0..BUF_SIZE{
+            hashes_buffer[offset + i] = buffer[i];
         }
+        offset += BUF_SIZE;
     }
+    let num_to_process = len - offset;
+    if num_to_process != 0{
+        create_hashes_new(arrays, random_state, &mut buffer,offset as u32, num_to_process as u32)?;
+        for i in 0..num_to_process{
+            hashes_buffer[i+offset] = buffer[i];
+        }
+    }  
     Ok(hashes_buffer)
 }
 

@@ -539,7 +539,6 @@ pub fn project_schema(
     };
     Ok(schema)
 }
-
 pub mod aggregates;
 pub mod analyze;
 pub mod coalesce_batches;
