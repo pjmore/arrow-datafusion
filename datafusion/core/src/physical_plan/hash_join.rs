@@ -1,4 +1,3 @@
-#![allow(unused_variables,dead_code,unused_imports)]
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
 // distributed with this work for additional information
@@ -16,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Defines the join plan for executing partitions in parallel and then joining the results
-// into a set of partitions.
+//! Defines the join plan for executing partitions in parallel and then joining the results
+//! into a set of partitions.
 
 use ahash::RandomState;
 
@@ -25,10 +24,10 @@ use arrow::{
     array::{
         ArrayData, ArrayRef, BooleanArray, LargeStringArray, PrimitiveArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
-        UInt32BufferBuilder, UInt32Builder, UInt64BufferBuilder, UInt64Builder, StringOffsetSizeTrait, GenericStringArray, DictionaryArray, BufferBuilder, Date32Array, Date64Array,
+        UInt32BufferBuilder, UInt32Builder, UInt64BufferBuilder, UInt64Builder, BufferBuilder, Date32Array, Date64Array,
     },
     compute,
-    datatypes::{UInt32Type, UInt64Type, ArrowNativeType, ArrowPrimitiveType, ArrowDictionaryKeyType, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, Float64Type, Float32Type, TimestampMillisecondType, TimestampSecondType, TimestampMicrosecondType, TimestampNanosecondType},
+    datatypes::{UInt32Type, UInt64Type},
 };
 use smallvec::{smallvec, SmallVec};
 use std::{sync::Arc};
@@ -56,7 +55,7 @@ use hashbrown::raw::RawTable;
 use super::{
     coalesce_partitions::CoalescePartitionsExec,
     expressions::PhysicalSortExpr,
-    join_utils::{build_join_schema, check_join_is_valid, ColumnIndex, JoinOn, JoinSide},  hash_utils::create_hashes_new,
+    join_utils::{build_join_schema, check_join_is_valid, ColumnIndex, JoinOn, JoinSide},  hash_utils::create_hashes_chunked,
 };
 use super::{
     expressions::Column,
@@ -537,6 +536,7 @@ impl HashJoinStream {
         join_metrics: HashJoinMetrics,
         null_equals_null: bool,
     ) -> Result<Self> {
+        let num_join_cols = on_left.len();
         Ok(HashJoinStream {
             join_data: JoinData::try_new(
                 schema,
@@ -553,6 +553,13 @@ impl HashJoinStream {
                 left_index_buffer: [0; HASH_BUFFER_SIZE],
                 right_index_buffer: [0; HASH_BUFFER_SIZE], 
                 match_buffer: [false; HASH_BUFFER_SIZE],
+                dictionary_hash_cache: {
+                    let mut cache = Vec::with_capacity(num_join_cols);
+                    for _ in 0..num_join_cols{
+                        cache.push(Vec::new());
+                    }
+                    cache
+                }
             },
             right,
             visited_left_side,
@@ -583,9 +590,6 @@ fn build_batch_from_indices(
     // 1. pick whether the column is from the left or right
     // 2. based on the pick, `take` items from the different RecordBatches
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(join_data.schema.fields().len());
-    for (l,r) in left_indices.iter().zip(right_indices.iter()){
-        //println!("{:?} <->{:?}", l,r);
-    }
     for column_index in &join_data.column_indices {
         let array = match column_index.side {
             JoinSide::Left => {
@@ -636,7 +640,8 @@ const HASH_BUFFER_SIZE: usize = 128;
     right_index_buffer: [u32; N],
     //N bytes taken up
     //Buffer that stores the row equalities of the mappings stored in the index_buffer. match_buffer[0]=true means that the rows are equal for the mapping at index_buffer[0] 
-    match_buffer: [bool; N],   
+    match_buffer: [bool; N],
+    dictionary_hash_cache: Vec<Vec<u64>>,   
 }
 
 impl<const N: usize> HashJoinBuffers<N>{
@@ -647,13 +652,7 @@ impl<const N: usize> HashJoinBuffers<N>{
         let ridx = *self.right_index_buffer.get_unchecked(idx);
         (is_match, lidx, ridx)
     }
-    #[inline]
-    fn get_matching_data(&self, idx: u32)->(bool, u64, u32){
-        let is_match = self.match_buffer[idx as usize];
-        let lidx = self.left_index_buffer[idx as usize];
-        let ridx = self.right_index_buffer[idx as usize];
-        (is_match, lidx, ridx)
-    }
+
     #[inline]
     unsafe fn set_mapping_data(&mut self, idx: u32, lidx: u64, ridx: u32){
         *self.left_index_buffer.get_unchecked_mut(idx as usize ) = lidx;
@@ -672,7 +671,7 @@ impl<const N: usize> HashJoinBuffers<N>{
             }else{
                 num_to_process
             };
-            let match_count = check_equal_rows_vectorized_new(matches, &left_arrays, &right_arrays, left_indexes, right_indexes, num_to_process, null_equals_null)?;
+            let match_count = check_equal_rows_vectorized(matches, &left_arrays, &right_arrays, left_indexes, right_indexes, num_to_process, null_equals_null)?;
             //if match_count != 0{
             right_indices.reserve(match_count as usize);
             left_indices.reserve(match_count as usize);
@@ -694,7 +693,7 @@ impl<const N: usize> HashJoinBuffers<N>{
             num_to_process
         };
         //println!("Processing right buffers: ISFull[{}] {}",PROCESS_ALL, num_to_process);
-        check_equal_rows_vectorized_new(matches, &left_arrays, &right_arrays, left_indexes, right_indexes, num_to_process, null_equals_null)?;
+        check_equal_rows_vectorized(matches, &left_arrays, &right_arrays, left_indexes, right_indexes, num_to_process, null_equals_null)?;
         self.build_mappings_full_or_right(left_indices,  right_indices, num_to_process, curr_ridx, matched)?;
         Ok(())
     }
@@ -708,7 +707,7 @@ impl<const N: usize> HashJoinBuffers<N>{
         }else{
             num_to_process
         };
-        check_equal_rows_vectorized_new(matches, &left_arrays, &right_arrays, left_indexes, right_indexes, num_to_process, null_equals_null)?;
+        check_equal_rows_vectorized(matches, &left_arrays, &right_arrays, left_indexes, right_indexes, num_to_process, null_equals_null)?;
         self.build_mappings_semi_or_anti(left_indices, num_to_process);
         
         Ok(())
@@ -724,74 +723,10 @@ impl<const N: usize> HashJoinBuffers<N>{
 
 
 
-/// returns a vector with (index from left, index from right).
-/// The size of this vector corresponds to the total size of a joined batch
-// For a join on column A:
-// left       right
-//     batch 1
-// A B         A D
-// ---------------
-// 1 a         3 6
-// 2 b         1 2
-// 3 c         2 4
-//     batch 2
-// A B         A D
-// ---------------
-// 1 a         5 10
-// 2 b         2 2
-// 4 d         1 1
-// indices (batch, batch_row)
-// left       right
-// (0, 2)     (0, 0)
-// (0, 0)     (0, 1)
-// (0, 1)     (0, 2)
-// (1, 0)     (0, 1)
-// (1, 1)     (0, 2)
-// (0, 1)     (1, 1)
-// (0, 0)     (1, 2)
-// (1, 1)     (1, 1)
-// (1, 0)     (1, 2)
-
-fn build_join_indexes_left<const N: usize>(
-    buffers: &mut HashJoinBuffers<N>, 
-    left_data:&JoinLeftData, 
-    right: &RecordBatch,
-    left_on: &[Column],
-    right_on: &[Column],
-    random_state: &RandomState,
-    null_equals_null: bool
-)->Result<(UInt64Array, UInt32Array)>{
-    let mut left_indices = UInt64Builder::new(0);
-    let mut right_indices = UInt32Builder::new(0);
-    /* 
-    // First visit all of the rows
-    for (row, hash_value) in hash_values.iter().enumerate() {
-        if let Some((_, indices)) =
-            left.0.get(*hash_value, |(hash, _)| *hash_value == *hash)
-        {
-            for &i in indices {
-                // Collision check
-                if equal_rows(
-                    i as usize,
-                    row,
-                    &left_join_values,
-                    &keys_values,
-                    *null_equals_null,
-                )? {
-                    left_indices.append_value(i)?;
-                    right_indices.append_value(row as u32)?;
-                }
-            }
-        };
-    }
-    */
-    Ok((left_indices.finish(), right_indices.finish()))
-}
 
 impl<const N:usize> HashJoinBuffers<N>{
     fn build_mappings_full_or_right(&self,left_indices: &mut UInt64Builder, right_indices: &mut UInt32Builder, num_to_process: u32, curr_ridx: &mut u32, matched: &mut bool)->ArrowResult<()>{
         assert!(num_to_process <= N as u32);
-        
         for i in 0..num_to_process{
             let (is_match, lidx, ridx) = unsafe{self.get_matching_data_unchecked(i as usize)};
             if *curr_ridx != ridx{
@@ -815,26 +750,25 @@ impl<const N:usize> HashJoinBuffers<N>{
     
     fn build_mappings_inner_or_left(&self, left_indices: &mut BufferBuilder<u64>, right_indices: &mut BufferBuilder<u32>, num_to_process: u32){
         assert!(num_to_process as usize <= N);
-        (0..num_to_process)
-            .map(|i| unsafe{self.get_matching_data_unchecked(i as usize)})
-            .filter(|i| i.0)
-            .for_each(|(_, lidx, ridx)|{
+        for i in 0..num_to_process{
+            let (is_match, lidx, ridx) = unsafe{self.get_matching_data_unchecked(i as usize)};
+            if is_match{
                 left_indices.append(lidx);
                 right_indices.append(ridx as u32);
-            });
-
+            }
+        }
     }
 
     fn build_mappings_semi_or_anti(&self, left_indices: &mut BufferBuilder<u64>, num_to_process: u32){
         assert!(num_to_process as usize <= N);
         for i in 0..num_to_process{
-            let (is_match, lidx, ridx) = unsafe{self.get_matching_data_unchecked(i as usize)};
+            let is_match = *unsafe{self.match_buffer.get_unchecked(i as usize)};
+            let lidx = *unsafe{self.left_index_buffer.get_unchecked(i as usize)};
             if is_match{
                 left_indices.append(lidx);
             }
         }
     }
-
 }
 
 
@@ -859,22 +793,12 @@ fn build_join_indexes_full_or_right<const N: usize>(
     let mut buffer_idx:u32 = 0;
     let right_row_count:u32 = keys_values[0].len().try_into().expect("Number of rows for record batch should be less than u32::MAX, which is 4294967295, rows");
     
-    //println!("THere are {} right rows", right_row_count);
-    //println!("Left hashes: ");
-    for v in unsafe{left_hashmap.0.iter()}{
-        let v = unsafe{v.as_ref()};
-        //println!("\t{}={:?}", v.0, v.1);
-    }
     let mut curr_ridx = u32::MAX;
     let mut matched = true;
     while right_idx < right_row_count{
         let num_to_process = (right_row_count - right_idx).min(N as u32);
         //Fill the buffer with num_to_process hashes
-        create_hashes_new(&keys_values, random_state, &mut buffers.hash_buffer, right_idx, num_to_process)?;
-        //println!("Right hashes: {:?}", &buffers.hash_buffer[..(num_to_process as usize)]);
-        for col in keys_values{
-            //println!("{:?}", col);
-        }
+        create_hashes_chunked(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache,right_idx, num_to_process)?;
         //For each hash get matching row mappings. When buffer is full then 
         for hash_idx in 0..num_to_process{
             let row = right_idx + hash_idx;
@@ -892,7 +816,6 @@ fn build_join_indexes_full_or_right<const N: usize>(
                     }
                 }
             }else{
-                //println!("Adding null<->{row}");
                 left_indices.append_null()?;
                 right_indices.append_value(row as u32)?;
             }
@@ -922,7 +845,6 @@ fn build_join_indexes_inner_or_left<const N: usize>(
     buffers: &mut HashJoinBuffers<N>,
     null_equals_null: bool
 )->Result<(UInt64Array, UInt32Array)>{
-    //println!("building left or inner join indexes");
     assert!(N <= u32::MAX as usize);
     // Using a buffer builder to avoid slower normal builder
     let mut left_indices = UInt64BufferBuilder::new(0);
@@ -930,21 +852,12 @@ fn build_join_indexes_inner_or_left<const N: usize>(
     let mut right_idx = 0;
     let mut buffer_idx:u32 = 0;
     let right_row_count:u32 = keys_values[0].len().try_into().expect("Number of rows for record batch should be less than u32::MAX, which is 4294967295, rows");
-    //println!("THere are {} right rows", right_row_count);
-    //println!("Left hashes: ");
-    for v in unsafe{left_hashmap.0.iter()}{
-        let v = unsafe{v.as_ref()};
-        //println!("\t{}={:?}", v.0, v.1);
-    }
+
     
     while right_idx < right_row_count{
         let num_to_process = (right_row_count - right_idx).min(N as u32);
         //Fill the buffer with num_to_process hashes
-        create_hashes_new(&keys_values, random_state, &mut buffers.hash_buffer, right_idx, num_to_process)?;
-        //println!("Right hashes: {:?}", &buffers.hash_buffer[..(num_to_process as usize)]);
-        for col in keys_values{
-            //println!("{:?}", col);
-        }
+        create_hashes_chunked(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache, right_idx, num_to_process)?;
         //For each hash get matching row mappings. When buffer is full then 
         for hash_idx in 0..num_to_process{
             let row = right_idx + hash_idx;
@@ -1003,7 +916,7 @@ fn build_join_indexes_semi_or_anti<const N: usize>(
     while right_idx < right_row_count{
         let num_to_process = (right_row_count - right_idx).min(N as u32);
         //Fill the buffer with num_to_process hashes
-        create_hashes_new(&keys_values, random_state, &mut buffers.hash_buffer, right_idx, num_to_process)?;
+        create_hashes_chunked(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache, right_idx, num_to_process)?;
 
         
         //For each hash get matching row mappings. When buffer is full then 
@@ -1043,221 +956,14 @@ fn build_join_indexes_semi_or_anti<const N: usize>(
 
 
 
-
-
-fn build_join_indexes(
-    match_buffer: &mut Vec<bool>,
-    join_index_buffer: &mut Vec<(u64, usize)>,
-    left_data: &JoinLeftData,
-    right: &RecordBatch,
-    join_type: JoinType,
-    left_on: &[Column],
-    right_on: &[Column],
-    random_state: &RandomState,
-    null_equals_null: &bool,
-) -> Result<(UInt64Array, UInt32Array)> {
-    let keys_values = right_on
-        .iter()
-        .map(|c| Ok(c.evaluate(right)?.into_array(right.num_rows())))
-        .collect::<Result<Vec<_>>>()?;
-    let left_join_values = left_on
-        .iter()
-        .map(|c| Ok(c.evaluate(&left_data.1)?.into_array(left_data.1.num_rows())))
-        .collect::<Result<Vec<_>>>()?;
-    let hashes_buffer = &mut vec![0; keys_values[0].len()];
-    let hash_values = create_hashes(&keys_values, random_state, hashes_buffer)?;
-    let left = &left_data.0;
-    join_index_buffer.clear();
-    match_buffer.clear();
-    match join_type {
-        JoinType::Inner | JoinType::Semi | JoinType::Anti => {
-            // Using a buffer builder to avoid slower normal builder
-            let mut left_indices = UInt64BufferBuilder::new(0);
-            let mut right_indices = UInt32BufferBuilder::new(0);
-            // Visit all of the right rows
-            for (row, hash_value) in hash_values.iter().enumerate() {
-                // Get the hash and find it in the build index
-
-                // For every item on the left and right we check if it matches
-                // This possibly contains rows with hash collisions,
-                // So we have to check here whether rows are equal or not
-                if let Some((_, indices)) =
-                    left.0.get(*hash_value, |(hash, _)| *hash_value == *hash)
-                {
-                    for &i in indices {
-                        // Check hash collisions
-                        if equal_rows(
-                            i as usize,
-                            row,
-                            &left_join_values,
-                            &keys_values,
-                            *null_equals_null,
-                        )? {
-                            left_indices.append(i);
-                            right_indices.append(row as u32);
-                        }
-                    }
-                }
-            }
-            let left = ArrayData::builder(DataType::UInt64)
-                .len(left_indices.len())
-                .add_buffer(left_indices.finish())
-                .build()
-                .unwrap();
-            let right = ArrayData::builder(DataType::UInt32)
-                .len(right_indices.len())
-                .add_buffer(right_indices.finish())
-                .build()
-                .unwrap();
-            
-            Ok((
-                PrimitiveArray::<UInt64Type>::from(left),
-                PrimitiveArray::<UInt32Type>::from(right),
-            ))
-        }
-        JoinType::Left => {
-            let mut left_indices = UInt64Builder::new(0);
-            let mut right_indices = UInt32Builder::new(0);
-
-            // First visit all of the rows
-            for (row, hash_value) in hash_values.iter().enumerate() {
-                if let Some((_, indices)) =
-                    left.0.get(*hash_value, |(hash, _)| *hash_value == *hash)
-                {
-                    for &i in indices {
-                        // Collision check
-                        if equal_rows(
-                            i as usize,
-                            row,
-                            &left_join_values,
-                            &keys_values,
-                            *null_equals_null,
-                        )? {
-                            left_indices.append_value(i)?;
-                            right_indices.append_value(row as u32)?;
-                        }
-                    }
-                };
-            }
-            Ok((left_indices.finish(), right_indices.finish()))
-        }
-        JoinType::Right | JoinType::Full => {
-            let mut left_indices = UInt64Builder::new(0);
-            let mut right_indices = UInt32Builder::new(0);
-
-            for (row, hash_value) in hash_values.iter().enumerate() {
-                match left.0.get(*hash_value, |(hash, _)| *hash_value == *hash) {
-                    Some((_, indices)) => {
-                        let mut no_match = true;
-                        for &i in indices {
-                            if equal_rows(
-                                i as usize,
-                                row,
-                                &left_join_values,
-                                &keys_values,
-                                *null_equals_null,
-                            )? {
-                                left_indices.append_value(i)?;
-                                right_indices.append_value(row as u32)?;
-                                no_match = false;
-                            }
-                        }
-                        // If no rows matched left, still must keep the right
-                        // with all nulls for left
-                        if no_match {
-                            left_indices.append_null()?;
-                            right_indices.append_value(row as u32)?;
-                        }
-                    }
-                    None => {
-                        // when no match, add the row with None for the left side
-                        left_indices.append_null()?;
-                        right_indices.append_value(row as u32)?;
-                    }
-                }
-            }
-            Ok((left_indices.finish(), right_indices.finish()))
-        }
-    }
-}
-
-
-
-
-fn equal_rows_check<LARR: 'static, RARR: 'static, LeftNull: Fn(&LARR, usize)->bool + 'static, RightNull: Fn(&RARR, usize)->bool + 'static, IsEq: Fn(&LARR, usize, &RARR, usize)->bool, const N: usize, const  FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64;N],  right_indexes: &[u32; N],  l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32, left_is_null: LeftNull, right_is_null: RightNull, is_equal: IsEq)->u32{
-    let left_array = l.as_any().downcast_ref::<LARR>().unwrap();
-    let right_array = r.as_any().downcast_ref::<RARR>().unwrap();
-    //let mut at_least_one_match = false;
-    
-    
-
-    assert!(num_to_process  <= N as u32);
-    #[inline(always)]
-    fn get_mapping_data<'a, const N: usize>( matches: &'a mut [bool; N], left_indexes: &[u64;N],  right_indexes: &[u32; N], idx: u32)->(&'a mut bool, usize, usize){
-        let is_match = unsafe{matches.get_unchecked_mut(idx as usize)};
-        let lidx = *unsafe{left_indexes.get_unchecked(idx  as usize)};
-        let ridx = *unsafe{right_indexes.get_unchecked(idx  as usize)};
-        (is_match, lidx as usize, ridx as usize)
-    }
-    let mut match_count: u32 = 0;
-    if null_equals_null{
-        for idx in 0..num_to_process{
-            let (is_match, lidx,ridx) = get_mapping_data(matches, left_indexes, right_indexes, idx); 
-            let left_is_null = left_is_null(left_array, lidx);
-            let right_is_null = right_is_null(right_array, ridx);
-            let rows_eq = if left_is_null && right_is_null{
-                true
-            }else if left_is_null || right_is_null{
-                false
-            }else{
-                is_equal(left_array, lidx, right_array, ridx)
-            };
-            
-            *is_match = if FIRST_COL{
-                rows_eq
-            }else{
-                rows_eq && *is_match
-            };
-            match_count += *is_match as u8 as u32;
-        }
-    }else{
-        for idx in 0..num_to_process{
-            let (is_match, lidx,ridx) = get_mapping_data(matches, left_indexes, right_indexes, idx); 
-            let left_is_null = left_is_null(left_array, lidx);
-            let right_is_null = right_is_null(right_array, ridx);
-            let rows_eq = if left_is_null || right_is_null{
-                false
-            }else{
-                is_equal(left_array, lidx, right_array, ridx)
-            };
-            *is_match = if FIRST_COL{
-                rows_eq
-            }else{
-                rows_eq && *is_match
-            };
-            match_count += *is_match as u8 as u32;
-        }
-    }
-    match_count
-
-}
-
-
-
-
-
-
 macro_rules! declare_equal_rows_check{
-    (DECLARE: $fn_name:ident, $array_type:ident, $ty:ident, $internal_buffer_size:literal)=>{
+    (DECLARE_CUSTOM_GET_VAL: $fn_name:ident,$array_type:ty, $get_value:ident, $internal_buffer_size:literal)=>{
+        #[allow(unused_unsafe)]
         unsafe fn $fn_name<const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r:  &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
             //use prefetch::prefetch::{Read, prefetch, Data, Low as Locality};
             const INTERNAL_BUFFER_SIZE: usize = $internal_buffer_size;
             let l = l.as_any().downcast_ref::<$array_type>().unwrap();
             let r = r.as_any().downcast_ref::<$array_type>().unwrap();
-            let lvalues = l.values();
-            let rvalues = r.values();
-            let base_ptr = lvalues.as_ptr();
-
             let mut mchunks = (&mut matches[..(num_to_process as usize)]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
             let mut lchunks = left_indexes[..(num_to_process as usize)].chunks_exact(INTERNAL_BUFFER_SIZE);
             let mut rchunks = right_indexes[..(num_to_process as usize)].chunks_exact(INTERNAL_BUFFER_SIZE);
@@ -1269,8 +975,8 @@ macro_rules! declare_equal_rows_check{
             if l.null_count() ==0 && r.null_count() == 0{
                 for (mchunk, (lchunk, rchunk)) in (&mut mchunks).zip((&mut lchunks).zip(&mut rchunks)){
                     for (is_match, (lidx, ridx)) in mchunk.iter_mut().zip(lchunk.iter().zip(rchunk)){
-                        let lvalue = *lvalues.get_unchecked(*lidx as usize);
-                        let rvalue = *rvalues.get_unchecked(*ridx as usize);
+                        let lvalue = l.$get_value(*lidx as usize);
+                        let rvalue = r.$get_value(*ridx as usize);
                          *is_match = if FIRST_COL {
                             lvalue == rvalue
                         }else {
@@ -1288,8 +994,8 @@ macro_rules! declare_equal_rows_check{
                 for i in 0..mremain.len(){
                     let lidx = lremain[i];
                     let ridx = rremain[i];
-                    let lvalue = *lvalues.get_unchecked(lidx as usize);
-                    let rvalue = *rvalues.get_unchecked(ridx as usize);
+                    let lvalue = l.$get_value(lidx as usize);
+                    let rvalue = r.$get_value(ridx as usize);
                     mremain[i]= if FIRST_COL {
                         lvalue == rvalue
                     }else {
@@ -1300,8 +1006,8 @@ macro_rules! declare_equal_rows_check{
             }else{
                 for (mchunk, (lchunk, rchunk)) in (&mut mchunks).zip((&mut lchunks).zip(&mut rchunks)){
                     for (is_match, (lidx, ridx)) in mchunk.iter_mut().zip(lchunk.iter().zip(rchunk)){
-                        let lvalue = *lvalues.get_unchecked(*lidx as usize);
-                        let rvalue = *rvalues.get_unchecked(*ridx as usize);
+                        let lvalue = l.$get_value(*lidx as usize);
+                        let rvalue = r.$get_value(*ridx as usize);
                         let left_is_null = l.is_null(*lidx as usize);
                         let right_is_null = r.is_null(*lidx as usize);
                         let values_eq = (left_is_null && right_is_null && null_equals_null) || (!left_is_null && !right_is_null && lvalue == rvalue);
@@ -1320,16 +1026,9 @@ macro_rules! declare_equal_rows_check{
                 let rremain = rchunks.remainder();
                 for i in 0..mremain.len(){
                     let lidx = lremain[i];
-                    //This is fine since it is just used in prefetch instruction.
-                    //Prefetch out of bounds does nothing. 
-                    let ptr = base_ptr.add(lidx as usize);
-                    //prefetch::<Read, Locality, Data, _>(ptr);
-                }
-                for i in 0..mremain.len(){
-                    let lidx = lremain[i];
                     let ridx = rremain[i];
-                    let lvalue = *lvalues.get_unchecked(lidx as usize);
-                    let rvalue =  *rvalues.get_unchecked(ridx as usize);
+                    let lvalue = l.$get_value(lidx as usize);
+                    let rvalue = r.$get_value(ridx as usize);
                     let left_is_null = l.is_null(lidx as usize);
                     let right_is_null = r.is_null(lidx as usize);
                     let is_match = (left_is_null && right_is_null && null_equals_null) || (!left_is_null && !right_is_null && lvalue == rvalue);
@@ -1344,28 +1043,34 @@ macro_rules! declare_equal_rows_check{
             
             match_count
         }
+    };
+
+    (DECLARE: $fn_name:ident, $array_type:ty, $internal_buffer_size:literal)=>{
+        declare_equal_rows_check!(DECLARE_CUSTOM_GET_VAL: $fn_name, $array_type, value_unchecked, $internal_buffer_size);
     }
 }
 //Keep the number of prefetches low even though simd can process mor than 64 u8 elements at once
-declare_equal_rows_check!(DECLARE: check_equal_rows_uint8, UInt8Array, u8, 32);
-declare_equal_rows_check!(DECLARE: check_equal_rows_uint16, UInt16Array, u16, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_uint32, UInt32Array, u32, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_uint64, UInt64Array, u64, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_int8, Int8Array, i8, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_int16, Int16Array, i16, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_int32, Int32Array, i32, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_int64, Int64Array, i64, 16);
-declare_equal_rows_check!(DECLARE: check_equal_rows_float32, Float32Array, f32, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_float64, Float64Array, f64, 16);
+declare_equal_rows_check!(DECLARE: check_equal_rows_uint8, UInt8Array, 32);
+declare_equal_rows_check!(DECLARE: check_equal_rows_uint16, UInt16Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_uint32, UInt32Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_uint64, UInt64Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_int8, Int8Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_int16, Int16Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_int32, Int32Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_int64, Int64Array, 16);
+declare_equal_rows_check!(DECLARE: check_equal_rows_float32, Float32Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_float64, Float64Array, 16);
 //declare_equal_rows_check!(DECLARE: check_equal_rows_bool, BooleanArray, bool, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_date32, Date32Array, i32, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_date64, Date64Array, i64, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_time_s, TimestampSecondArray, i64, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_time_ms, TimestampMillisecondArray, i64, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_time_us, TimestampMicrosecondArray, i64, 64);
-declare_equal_rows_check!(DECLARE: check_equal_rows_time_ns, TimestampNanosecondArray, i64, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_date32, Date32Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_date64, Date64Array, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_time_s, TimestampSecondArray, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_time_ms, TimestampMillisecondArray, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_time_us, TimestampMicrosecondArray, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_time_ns, TimestampNanosecondArray, 64);
 
-
+declare_equal_rows_check!(DECLARE: check_equal_rows_utf8, StringArray, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_largeutf8, LargeStringArray, 64);
+declare_equal_rows_check!(DECLARE: check_equal_rows_bool, BooleanArray, 64);
 
 
 unsafe fn check_rows_equal_vectorized<const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N],
@@ -1381,9 +1086,7 @@ unsafe fn check_rows_equal_vectorized<const N: usize, const FIRST_COL: bool>(mat
             matches.iter_mut().for_each(|matches| *matches = true);
             num_to_process
         },
-        DataType::Boolean => equal_rows_check_same_type::<BooleanArray, _, _, N, FIRST_COL>(matches, left_indexes, right_indexes, l,r, null_equals_null, num_to_process,|arr, idx| arr.is_null(idx), |larr, lidx, rarr, ridx| {
-            larr.value(lidx) == rarr.value(ridx)
-        }),
+        DataType::Boolean => check_equal_rows_bool::<N, FIRST_COL>(matches,  left_indexes, right_indexes, l,r, null_equals_null, num_to_process ),
         DataType::Int8 => check_equal_rows_int8::<N, FIRST_COL>(matches,  left_indexes, right_indexes, l,r, null_equals_null, num_to_process),
         DataType::Int16 => check_equal_rows_int16::<N, FIRST_COL>(matches,   left_indexes, right_indexes, l,r, null_equals_null, num_to_process),
         DataType::Int32 => check_equal_rows_int32::<N, FIRST_COL>(matches,  left_indexes, right_indexes, l,r, null_equals_null, num_to_process),
@@ -1402,98 +1105,12 @@ unsafe fn check_rows_equal_vectorized<const N: usize, const FIRST_COL: bool>(mat
         },
         DataType::Date32 => check_equal_rows_date32::<N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
         DataType::Date64 => check_equal_rows_date64::<N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
-
-        DataType::Utf8 => equal_rows_check_utf8::<i32,N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
-        DataType::LargeUtf8 => equal_rows_check_utf8::<i64,N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
-        /*DataType::Dictionary(key_ty, value_ty) if value_ty.as_ref() == &DataType::Utf8=>{
-            let right_key_ty = if let DataType::Dictionary(rkey_ty, lval_ty) = r.data_type(){
-                if lval_ty.as_ref() != &DataType::Utf8{
-                    panic!("Found nont utf8 values");
-                }
-                rkey_ty.as_ref()
-            }else{
-                panic!("Right was not dictionary type");
-            };
-            match (key_ty.as_ref(), right_key_ty){
-                (DataType::Int8, DataType::Int8) => equal_rows_utf8_dictionaries::<Int8Type,Int8Type,N, FIRST_COL>(matches, first_column, indexes, l,r,null_equals_null), 
-                (DataType::Int8, DataType::Int16) => equal_rows_utf8_dictionaries::<Int8Type,Int16Type,N, FIRST_COL>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int8, DataType::Int32) => equal_rows_utf8_dictionaries::<Int8Type,Int32Type,N, FIRST_COL>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int8, DataType::Int64) => equal_rows_utf8_dictionaries::<Int8Type,Int64Type,N, FIRST_COL>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int8, DataType::UInt8) => equal_rows_utf8_dictionaries::<Int8Type,UInt8Type,N, FIRST_COL>(matches, first_column, indexes, l,r,null_equals_null), 
-                (DataType::Int8, DataType::UInt16) => equal_rows_utf8_dictionaries::<Int8Type,UInt16Type,N, FIRST_COL>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int8, DataType::UInt32) => equal_rows_utf8_dictionaries::<Int8Type,UInt32Type,N, FIRST_COL>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int8, DataType::UInt64) => equal_rows_utf8_dictionaries::<Int8Type,UInt64Type,N, FIRST_COL>(matches, first_column, indexes, l,r,null_equals_null),
-
-
-                (DataType::Int16, DataType::Int8) => equal_rows_utf8_dictionaries::<Int16Type,Int8Type>(matches, first_column, indexes, l,r,null_equals_null), 
-                (DataType::Int16, DataType::Int16) => equal_rows_utf8_dictionaries::<Int16Type,Int16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int16, DataType::Int32) => equal_rows_utf8_dictionaries::<Int16Type,Int32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int16, DataType::Int64) => equal_rows_utf8_dictionaries::<Int16Type,Int64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int16, DataType::UInt8) => equal_rows_utf8_dictionaries::<Int16Type,UInt8Type>(matches, first_column, indexes, l,r,null_equals_null), 
-                (DataType::Int16, DataType::UInt16) => equal_rows_utf8_dictionaries::<Int16Type,UInt16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int16, DataType::UInt32) => equal_rows_utf8_dictionaries::<Int16Type,UInt32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int16, DataType::UInt64) => equal_rows_utf8_dictionaries::<Int16Type,UInt64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                
-                (DataType::Int32, DataType::Int8)  => equal_rows_utf8_dictionaries::<Int32Type,Int8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int32, DataType::Int16) => equal_rows_utf8_dictionaries::<Int32Type,Int16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int32, DataType::Int32) => equal_rows_utf8_dictionaries::<Int32Type,Int32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int32, DataType::Int64) => equal_rows_utf8_dictionaries::<Int32Type,Int64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int32, DataType::UInt8)  => equal_rows_utf8_dictionaries::<Int32Type,UInt8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int32, DataType::UInt16) => equal_rows_utf8_dictionaries::<Int32Type,UInt16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int32, DataType::UInt32) => equal_rows_utf8_dictionaries::<Int32Type,UInt32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int32, DataType::UInt64) => equal_rows_utf8_dictionaries::<Int32Type,UInt64Type>(matches, first_column, indexes, l,r,null_equals_null),
-
-                (DataType::Int64, DataType::Int8) => equal_rows_utf8_dictionaries::<Int64Type,Int8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int64, DataType::Int16)=> equal_rows_utf8_dictionaries::<Int64Type,Int16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int64, DataType::Int32)=> equal_rows_utf8_dictionaries::<Int64Type,Int32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int64, DataType::Int64)=> equal_rows_utf8_dictionaries::<Int64Type,Int64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int64, DataType::UInt8) => equal_rows_utf8_dictionaries::<Int64Type,UInt8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int64, DataType::UInt16)=> equal_rows_utf8_dictionaries::<Int64Type,UInt16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int64, DataType::UInt32)=> equal_rows_utf8_dictionaries::<Int64Type,UInt32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::Int64, DataType::UInt64)=> equal_rows_utf8_dictionaries::<Int64Type,UInt64Type>(matches, first_column, indexes, l,r,null_equals_null),
-
-                (DataType::UInt8, DataType::Int8) => equal_rows_utf8_dictionaries::<UInt8Type,Int8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt8, DataType::Int16)=> equal_rows_utf8_dictionaries::<UInt8Type,Int16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt8, DataType::Int32)=> equal_rows_utf8_dictionaries::<UInt8Type,Int32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt8, DataType::Int64)=> equal_rows_utf8_dictionaries::<UInt8Type,Int64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt8, DataType::UInt8) => equal_rows_utf8_dictionaries::<UInt8Type,UInt8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt8, DataType::UInt16)=> equal_rows_utf8_dictionaries::<UInt8Type,UInt16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt8, DataType::UInt32)=> equal_rows_utf8_dictionaries::<UInt8Type,UInt32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt8, DataType::UInt64)=> equal_rows_utf8_dictionaries::<UInt8Type,UInt64Type>(matches, first_column, indexes, l,r,null_equals_null),
-
-                (DataType::UInt16, DataType::Int8) => equal_rows_utf8_dictionaries::<UInt16Type,Int8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt16, DataType::Int16)=> equal_rows_utf8_dictionaries::<UInt16Type,Int16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt16, DataType::Int32)=> equal_rows_utf8_dictionaries::<UInt16Type,Int32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt16, DataType::Int64)=> equal_rows_utf8_dictionaries::<UInt16Type,Int64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt16, DataType::UInt8) => equal_rows_utf8_dictionaries::<UInt16Type,UInt8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt16, DataType::UInt16)=> equal_rows_utf8_dictionaries::<UInt16Type,UInt16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt16, DataType::UInt32)=> equal_rows_utf8_dictionaries::<UInt16Type,UInt32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt16, DataType::UInt64)=> equal_rows_utf8_dictionaries::<UInt16Type,UInt64Type>(matches, first_column, indexes, l,r,null_equals_null),
-
-                (DataType::UInt32, DataType::Int8) => equal_rows_utf8_dictionaries::<UInt32Type,Int8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt32, DataType::Int16)=> equal_rows_utf8_dictionaries::<UInt32Type,Int16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt32, DataType::Int32)=> equal_rows_utf8_dictionaries::<UInt32Type,Int32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt32, DataType::Int64)=> equal_rows_utf8_dictionaries::<UInt32Type,Int64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt32, DataType::UInt8) => equal_rows_utf8_dictionaries::<UInt32Type,UInt8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt32, DataType::UInt16)=> equal_rows_utf8_dictionaries::<UInt32Type,UInt16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt32, DataType::UInt32)=> equal_rows_utf8_dictionaries::<UInt32Type,UInt32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt32, DataType::UInt64)=> equal_rows_utf8_dictionaries::<UInt32Type,UInt64Type>(matches, first_column, indexes, l,r,null_equals_null),
-
-                (DataType::UInt64, DataType::Int8) => equal_rows_utf8_dictionaries::<UInt64Type,Int8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt64, DataType::Int16)=> equal_rows_utf8_dictionaries::<UInt64Type,Int16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt64, DataType::Int32)=> equal_rows_utf8_dictionaries::<UInt64Type,Int32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt64, DataType::Int64)=> equal_rows_utf8_dictionaries::<UInt64Type,Int64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt64, DataType::UInt8) => equal_rows_utf8_dictionaries::<UInt64Type,UInt8Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt64, DataType::UInt16)=> equal_rows_utf8_dictionaries::<UInt64Type,UInt16Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt64, DataType::UInt32)=> equal_rows_utf8_dictionaries::<UInt64Type,UInt32Type>(matches, first_column, indexes, l,r,null_equals_null),
-                (DataType::UInt64, DataType::UInt64)=> equal_rows_utf8_dictionaries::<UInt64Type,UInt64Type>(matches, first_column, indexes, l,r,null_equals_null),
-                _=> panic!(),
-            }
-        }*/
-        _ => {
+        DataType::Utf8 => check_equal_rows_utf8::<N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
+        DataType::LargeUtf8 => check_equal_rows_largeutf8::<N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
+        dt => {
             // This is internal because we should have caught this before.
             return Err(DataFusionError::Internal(
-                "Unsupported data type in hasher".to_string(),
+                format!("Datatype was supported by the hasher but equality is not implemented for {}", dt)
             ));
         }
     };
@@ -1501,7 +1118,7 @@ unsafe fn check_rows_equal_vectorized<const N: usize, const FIRST_COL: bool>(mat
 }
 
 
-unsafe fn check_equal_rows_vectorized_new<const N: usize>(
+unsafe fn check_equal_rows_vectorized<const N: usize>(
     matches: &mut [bool; N],
     left_arrays: &[ArrayRef],
     right_arrays: &[ArrayRef],
@@ -1514,237 +1131,19 @@ unsafe fn check_equal_rows_vectorized_new<const N: usize>(
         return Err(DataFusionError::Internal(format!("Found process count {} out of range of {}", num_to_process, N)));
     }
     let mut match_count = check_rows_equal_vectorized::<N, true>(matches, left_arrays[0].as_ref(), right_arrays[0].as_ref(), left_indexes, right_indexes, num_to_process, null_equals_null)?;
-    let mut col = 1;
     for (l,r) in left_arrays.iter().zip(right_arrays.iter()).skip(1){
         if match_count == 0{
             break;
         }
-        match_count = check_rows_equal_vectorized::<N, false>(matches, l, r, left_indexes, right_indexes, num_to_process, null_equals_null)?;
-
-        col +=1;
-        
+        match_count = check_rows_equal_vectorized::<N, false>(matches, l, r, left_indexes, right_indexes, num_to_process, null_equals_null)?;        
     }
     Ok(match_count)
 }
 
 
 
-fn equal_rows_check_same_type<ARR, IsNull, IsEq, const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32, is_null: IsNull, is_equal: IsEq)->u32
-where ARR: 'static,
-IsNull: Fn(&ARR, usize)->bool + Copy + 'static,
-IsEq: Fn(&ARR, usize, &ARR, usize)->bool,
-
-{
-    equal_rows_check::<ARR, ARR,_, _, _, N, FIRST_COL>(matches, left_indexes, right_indexes, l,r, null_equals_null, num_to_process, is_null, is_null, is_equal)
-}
 
 
-fn equal_rows_check_primitive<T: ArrowPrimitiveType, const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
-    equal_rows_check_same_type::<PrimitiveArray<T>, _,_, N, FIRST_COL>(matches, left_indexes, right_indexes, l, r, null_equals_null, num_to_process, |arr, idx| arr.is_null(idx), |larr, lidx, rarr, ridx| larr.value(lidx) == rarr.value(ridx))
-}
-
-fn equal_rows_check_utf8<O: StringOffsetSizeTrait, const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
-    equal_rows_check_same_type::<GenericStringArray<O>, _, _, N, FIRST_COL>(matches, left_indexes, right_indexes, l, r, null_equals_null, num_to_process, |arr, idx| arr.is_null(idx), |larr,lidx, rarr, ridx| larr.value(lidx) == rarr.value(ridx))
-}
-
-
-
-fn equal_rows_check_dict_prim<K: ArrowDictionaryKeyType, T: ArrowPrimitiveType, const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
-    equal_rows_check::<DictionaryArray<K>, PrimitiveArray<T>, _,_,_, N, FIRST_COL>(matches, left_indexes, right_indexes, l, r, null_equals_null, 
-        num_to_process,
-        |larr, idx| larr.is_null(idx), |larr, idx| larr.is_null(idx),
-        |larr: &DictionaryArray<K>, lidx, rarr: &PrimitiveArray<T>, ridx|->bool{
-            let key = larr.keys().value(lidx).to_usize().unwrap();
-            let values = larr.values().as_any().downcast_ref::<PrimitiveArray<T>>().unwrap();
-            let lval = values.value(key);
-            let rval = rarr.value(ridx);
-            lval == rval 
-        })
-}
-
-fn equal_rows_check_prim_dict<T: ArrowPrimitiveType, K: ArrowDictionaryKeyType, const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
-    equal_rows_check::< PrimitiveArray<T>,DictionaryArray<K>, _,_,_, N, FIRST_COL>(matches, left_indexes, right_indexes, l, r, null_equals_null, 
-        num_to_process,
-        |larr, idx| larr.is_null(idx), |larr, idx| larr.is_null(idx),
-        |larr, lidx, rarr, ridx|->bool{
-            let lval = larr.value(ridx);
-            let key = rarr.keys().value(ridx).to_usize().unwrap();
-            let values = rarr.values().as_any().downcast_ref::<PrimitiveArray<T>>().unwrap();
-            let rval = values.value(key);
-            lval == rval 
-        })
-}
-
-fn equal_rows_utf8_dictionaries<LK: ArrowDictionaryKeyType, RK: ArrowDictionaryKeyType, const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
-    equal_rows_check::<DictionaryArray<LK>, DictionaryArray<RK>, _, _, _, N, FIRST_COL>(
-        matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process,
-        |larr, idx| larr.is_null(idx),
-        |rarr, idx| rarr.is_null(idx),
-        |larr, lidx, rarr, ridx| {
-            let lkey = larr.keys().value(lidx).to_usize().unwrap();
-            let lvalues = larr.values().as_any().downcast_ref::<GenericStringArray<i32>>().unwrap();
-            let lval = lvalues.value(lkey);
-
-            let rkey = rarr.keys().value(ridx).to_usize().unwrap();
-            let rvalues = rarr.values().as_any().downcast_ref::<GenericStringArray<i32>>().unwrap();
-            let rval = rvalues.value(rkey);
-            lval == rval 
-        }
-    )
-}
-
-fn equal_rows_check_dict_utf8<K: ArrowDictionaryKeyType, O: StringOffsetSizeTrait, const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
-    equal_rows_check::<DictionaryArray<K>, GenericStringArray<O>, _, _, _, N, FIRST_COL>(
-        matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process,
-        |larr, idx| larr.is_null(idx),
-        |rarr, idx| rarr.is_null(idx),
-        |larr, lidx, rarr, ridx| {
-            let key = larr.keys().value(lidx).to_usize().unwrap();
-            let values = larr.values().as_any().downcast_ref::<GenericStringArray<O>>().unwrap();
-            let lval = values.value(key);
-            let rval = rarr.value(ridx);
-            lval == rval 
-        }
-    )
-}
-
-
-fn equal_rows_check_utf8_dict<K: ArrowDictionaryKeyType, O: StringOffsetSizeTrait, const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r: &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
-    equal_rows_check::<GenericStringArray<O>, DictionaryArray<K>, _, _,_, N, FIRST_COL>(
-        matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process,
-        |larr, idx| larr.is_null(idx),
-        |rarr, idx| rarr.is_null(idx),
-        |larr, lidx, rarr, ridx| {
-            let lval = larr.value(lidx);
-
-            let key = rarr.keys().value(ridx).to_usize().unwrap();
-            let values = rarr.values().as_any().downcast_ref::<GenericStringArray<O>>().unwrap();
-            let rval = values.value(key);
-            lval == rval 
-        }
-    )
-}
-
-
-macro_rules! equal_rows_elem {
-    ($array_type:ident, $l: ident, $r: ident, $left: ident, $right: ident, $null_equals_null: ident) => {{
-        let left_array = $l.as_any().downcast_ref::<$array_type>().unwrap();
-        let right_array = $r.as_any().downcast_ref::<$array_type>().unwrap();
-
-        match (left_array.is_null($left), right_array.is_null($right)) {
-            (false, false) => left_array.value($left) == right_array.value($right),
-            (true, true) => $null_equals_null,
-            _ => false,
-        }
-    }};
-}
-
-/// Left and right row have equal values
-fn equal_rows(
-    left: usize,
-    right: usize,
-    left_arrays: &[ArrayRef],
-    right_arrays: &[ArrayRef],
-    null_equals_null: bool,
-) -> Result<bool> {
-    let mut err = None;
-    let res = left_arrays
-        .iter()
-        .zip(right_arrays)
-        .all(|(l, r)| match l.data_type() {
-            DataType::Null => true,
-            DataType::Boolean => {
-                equal_rows_elem!(BooleanArray, l, r, left, right, null_equals_null)
-            }
-            DataType::Int8 => {
-                equal_rows_elem!(Int8Array, l, r, left, right, null_equals_null)
-            }
-            DataType::Int16 => {
-                equal_rows_elem!(Int16Array, l, r, left, right, null_equals_null)
-            }
-            DataType::Int32 => {
-                equal_rows_elem!(Int32Array, l, r, left, right, null_equals_null)
-            }
-            DataType::Int64 => {
-                equal_rows_elem!(Int64Array, l, r, left, right, null_equals_null)
-            }
-            DataType::UInt8 => {
-                equal_rows_elem!(UInt8Array, l, r, left, right, null_equals_null)
-            }
-            DataType::UInt16 => {
-                equal_rows_elem!(UInt16Array, l, r, left, right, null_equals_null)
-            }
-            DataType::UInt32 => {
-                equal_rows_elem!(UInt32Array, l, r, left, right, null_equals_null)
-            }
-            DataType::UInt64 => {
-                equal_rows_elem!(UInt64Array, l, r, left, right, null_equals_null)
-            }
-            DataType::Float32 => {
-                equal_rows_elem!(Float32Array, l, r, left, right, null_equals_null)
-            }
-            DataType::Float64 => {
-                equal_rows_elem!(Float64Array, l, r, left, right, null_equals_null)
-            }
-            DataType::Timestamp(time_unit, None) => match time_unit {
-                TimeUnit::Second => {
-                    equal_rows_elem!(
-                        TimestampSecondArray,
-                        l,
-                        r,
-                        left,
-                        right,
-                        null_equals_null
-                    )
-                }
-                TimeUnit::Millisecond => {
-                    equal_rows_elem!(
-                        TimestampMillisecondArray,
-                        l,
-                        r,
-                        left,
-                        right,
-                        null_equals_null
-                    )
-                }
-                TimeUnit::Microsecond => {
-                    equal_rows_elem!(
-                        TimestampMicrosecondArray,
-                        l,
-                        r,
-                        left,
-                        right,
-                        null_equals_null
-                    )
-                }
-                TimeUnit::Nanosecond => {
-                    equal_rows_elem!(
-                        TimestampNanosecondArray,
-                        l,
-                        r,
-                        left,
-                        right,
-                        null_equals_null
-                    )
-                }
-            },
-            DataType::Utf8 => {
-                equal_rows_elem!(StringArray, l, r, left, right, null_equals_null)
-            }
-            DataType::LargeUtf8 => {
-                equal_rows_elem!(LargeStringArray, l, r, left, right, null_equals_null)
-            }
-            _ => {
-                // This is internal because we should have caught this before.
-                err = Some(Err(DataFusionError::Internal(
-                    "Unsupported data type in hasher".to_string(),
-                )));
-                false
-            }
-        });
-
-    err.unwrap_or(Ok(res))
-}
 
 // Produces a batch for left-side rows that have/have not been matched during the whole join
 fn produce_from_matched(
@@ -1789,14 +1188,13 @@ fn produce_from_matched(
 struct JoinData{
     /// Input schema
     schema: Arc<Schema>,
-    /// columns from the left
-    on_left: Vec<Column>,
     /// columns from the right used to compute the hash
     on_right: Vec<Column>,
     /// type of the join
     join_type: JoinType,
     /// information from the left
     left_data: JoinLeftData,
+    /// data for the join columns from the left side of the join
     left_join_values: Vec<Arc<dyn Array>>,
     /// Random state used for hashing initialization
     random_state: RandomState,
@@ -1807,47 +1205,6 @@ struct JoinData{
 }
 
 
-fn build_semi_or_anti_join_indices<const N: usize>(left_join_values: &[Arc<dyn Array>], keys_values:&[Arc<dyn Array>], left_hashmap: &JoinHashMap, buffers: &mut HashJoinBuffers<N>, random_state: &RandomState, null_equals_null: bool)->Result<UInt64Array>{
-        // Using a buffer builder to avoid slower normal builder
-        let mut left_indices = UInt64BufferBuilder::new(0);
-        let mut right_idx: u32 = 0;
-        let mut buffer_idx: u32 = 0;
-        let right_row_count: u32 = keys_values[0].len().try_into().expect("Number of rows for record batch should be less than u32::MAX, which is 4294967295, rows");
-        while right_idx < right_row_count{
-            let num_to_process = (right_row_count - right_idx).min(N as u32);
-            //Fill the buffer with num_to_process hashes
-            create_hashes_new(&keys_values, &random_state, &mut buffers.hash_buffer, right_idx, num_to_process)?;
-    
-            
-            //For each hash get matching row mappings. When buffer is full then 
-            for hash_idx in 0..num_to_process{
-                let row = right_idx + hash_idx;
-                let hash_value = buffers.hash_buffer[hash_idx as usize];
-                if let Some((_, indices)) = left_hashmap.0.get(hash_value, |(hash, _)| hash_value == *hash){
-                    for i in indices{
-                        unsafe{buffers.set_mapping_data(buffer_idx, *i, row)};
-                        buffer_idx +=1;
-                        if buffer_idx == (N as u32){
-                            unsafe{buffers.process_buffers_semi_or_anti::<true>(&left_join_values, keys_values, &mut left_indices, num_to_process, null_equals_null)?};
-                            buffer_idx = 0;
-                        }
-                    }
-                }
-            }
-            right_idx += num_to_process;
-        }
-        if buffer_idx != 0{
-            unsafe{buffers.process_buffers_semi_or_anti::<false>(&left_join_values, keys_values, &mut left_indices, buffer_idx, null_equals_null)?};
-        }
-    
-        let left = ArrayData::builder(DataType::UInt64)
-            .len(left_indices.len())
-            .add_buffer(left_indices.finish())
-            .build()
-            .unwrap();
-        
-        Ok(PrimitiveArray::<UInt64Type>::from(left))
-}
 
 
 impl JoinData{
@@ -1856,7 +1213,6 @@ impl JoinData{
         Ok(
             Self{
                 schema,
-                on_left,
                 on_right,
                 join_type,
                 left_data,
@@ -2871,7 +2227,6 @@ mod tests {
             ("x", &vec![100, 200]),
             ("y", &vec![200, 300]),
         );
-        let schema = left.schema().clone();
         let random_state = RandomState::with_seeds(0, 0, 0, 0);
         let hashes_buff = &mut vec![0; left.num_rows()];
         let hashes =
@@ -2894,6 +2249,7 @@ mod tests {
             left_index_buffer: [0; N],
             right_index_buffer: [0; N],
             match_buffer: [false; N],
+            dictionary_hash_cache: vec![Vec::new()],
         });
         let on_left = vec![Column::new("a", 0)];
         let on_right = vec![Column::new("a", 0)];
