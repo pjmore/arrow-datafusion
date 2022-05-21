@@ -53,6 +53,8 @@ message LogicalPlanNode {
     UnionNode union = 19;
     CreateCatalogNode create_catalog = 20;
     SubqueryAliasNode subquery_alias = 21;
+    CreateViewNode create_view = 22;
+    OffsetNode offset = 23;
   }
 }
 
@@ -171,6 +173,12 @@ message CreateCatalogNode {
   datafusion.DfSchema schema = 3;
 }
 
+message CreateViewNode {
+  string name = 1;
+  LogicalPlanNode input = 2;
+  bool or_replace = 3;
+}
+
 // a node containing data for defining values list. unlike in SQL where it's two dimensional, here
 // the list is flattened, and with the field n_cols it can be parsed and partitioned into rows
 message ValuesNode {
@@ -244,6 +252,11 @@ message LimitNode {
   uint32 limit = 2;
 }
 
+message OffsetNode {
+  LogicalPlanNode input = 1;
+  uint32 offset = 2;
+}
+
 message SelectionExecNode {
   datafusion.LogicalExprNode expr = 1;
 }
@@ -266,7 +279,7 @@ message PhysicalPlanNode {
     ProjectionExecNode projection = 4;
     GlobalLimitExecNode global_limit = 6;
     LocalLimitExecNode local_limit = 7;
-    HashAggregateExecNode hash_aggregate = 8;
+    AggregateExecNode aggregate = 8;
     HashJoinExecNode hash_join = 9;
     ShuffleReaderExecNode shuffle_reader = 10;
     SortExecNode sort = 11;
@@ -519,7 +532,7 @@ message WindowAggExecNode {
   datafusion.Schema input_schema = 4;
 }
 
-message HashAggregateExecNode {
+message AggregateExecNode {
   repeated PhysicalExprNode group_expr = 1;
   repeated PhysicalExprNode aggr_expr = 2;
   AggregateMode mode = 3;
@@ -761,6 +774,11 @@ message TaskDefinition {
   PhysicalHashRepartition output_partitioning = 3;
   string session_id = 4;
   repeated KeyValuePair props = 5;
+}
+
+message JobSessionConfig {
+  string session_id = 1;
+  repeated KeyValuePair configs = 2;
 }
 
 message PollWorkResult {

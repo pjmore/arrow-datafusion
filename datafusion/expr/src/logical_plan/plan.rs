@@ -22,7 +22,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::{Column, DFSchemaRef, DataFusionError};
 use std::collections::HashSet;
 ///! Logical plan types
-use std::fmt::{self, Display, Formatter};
+use std::fmt::{self, Debug, Display, Formatter};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// A LogicalPlan represents the different types of relational
@@ -66,14 +67,20 @@ pub enum LogicalPlan {
     TableScan(TableScan),
     /// Produces no rows: An empty relation with an empty schema
     EmptyRelation(EmptyRelation),
+    /// Subquery
+    Subquery(Subquery),
     /// Aliased relation provides, or changes, the name of a relation.
     SubqueryAlias(SubqueryAlias),
     /// Produces the first `n` tuples from its input and discards the rest.
     Limit(Limit),
+    /// Adjusts the starting point at which the rest of the expressions begin to effect
+    Offset(Offset),
     /// Creates an external table.
     CreateExternalTable(CreateExternalTable),
     /// Creates an in memory table.
     CreateMemoryTable(CreateMemoryTable),
+    /// Creates a new view.
+    CreateView(CreateView),
     /// Creates a new catalog schema.
     CreateCatalogSchema(CreateCatalogSchema),
     /// Creates a new catalog (aka "Database").
@@ -112,6 +119,8 @@ impl LogicalPlan {
             LogicalPlan::CrossJoin(CrossJoin { schema, .. }) => schema,
             LogicalPlan::Repartition(Repartition { input, .. }) => input.schema(),
             LogicalPlan::Limit(Limit { input, .. }) => input.schema(),
+            LogicalPlan::Offset(Offset { input, .. }) => input.schema(),
+            LogicalPlan::Subquery(Subquery { subquery, .. }) => subquery.schema(),
             LogicalPlan::SubqueryAlias(SubqueryAlias { schema, .. }) => schema,
             LogicalPlan::CreateExternalTable(CreateExternalTable { schema, .. }) => {
                 schema
@@ -120,9 +129,8 @@ impl LogicalPlan {
             LogicalPlan::Analyze(analyze) => &analyze.schema,
             LogicalPlan::Extension(extension) => extension.node.schema(),
             LogicalPlan::Union(Union { schema, .. }) => schema,
-            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. }) => {
-                input.schema()
-            }
+            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
+            | LogicalPlan::CreateView(CreateView { input, .. }) => input.schema(),
             LogicalPlan::CreateCatalogSchema(CreateCatalogSchema { schema, .. }) => {
                 schema
             }
@@ -161,6 +169,7 @@ impl LogicalPlan {
                 schemas.insert(0, schema);
                 schemas
             }
+            LogicalPlan::Subquery(Subquery { subquery, .. }) => subquery.all_schemas(),
             LogicalPlan::SubqueryAlias(SubqueryAlias { schema, .. }) => {
                 vec![schema]
             }
@@ -180,6 +189,8 @@ impl LogicalPlan {
             | LogicalPlan::Repartition(Repartition { input, .. })
             | LogicalPlan::Sort(Sort { input, .. })
             | LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
+            | LogicalPlan::CreateView(CreateView { input, .. })
+            | LogicalPlan::Offset(Offset { input, .. })
             | LogicalPlan::Filter(Filter { input, .. }) => input.all_schemas(),
             LogicalPlan::DropTable(_) => vec![],
         }
@@ -225,10 +236,13 @@ impl LogicalPlan {
             // plans without expressions
             LogicalPlan::TableScan { .. }
             | LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Subquery(_)
             | LogicalPlan::SubqueryAlias(_)
             | LogicalPlan::Limit(_)
+            | LogicalPlan::Offset(_)
             | LogicalPlan::CreateExternalTable(_)
             | LogicalPlan::CreateMemoryTable(_)
+            | LogicalPlan::CreateView(_)
             | LogicalPlan::CreateCatalogSchema(_)
             | LogicalPlan::CreateCatalog(_)
             | LogicalPlan::DropTable(_)
@@ -254,12 +268,15 @@ impl LogicalPlan {
             LogicalPlan::Join(Join { left, right, .. }) => vec![left, right],
             LogicalPlan::CrossJoin(CrossJoin { left, right, .. }) => vec![left, right],
             LogicalPlan::Limit(Limit { input, .. }) => vec![input],
+            LogicalPlan::Offset(Offset { input, .. }) => vec![input],
+            LogicalPlan::Subquery(Subquery { subquery, .. }) => vec![subquery],
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => vec![input],
             LogicalPlan::Extension(extension) => extension.node.inputs(),
             LogicalPlan::Union(Union { inputs, .. }) => inputs.iter().collect(),
             LogicalPlan::Explain(explain) => vec![&explain.plan],
             LogicalPlan::Analyze(analyze) => vec![&analyze.input],
-            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. }) => {
+            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
+            | LogicalPlan::CreateView(CreateView { input, .. }) => {
                 vec![input]
             }
             // plans without inputs
@@ -392,10 +409,15 @@ impl LogicalPlan {
                 true
             }
             LogicalPlan::Limit(Limit { input, .. }) => input.accept(visitor)?,
+            LogicalPlan::Offset(Offset { input, .. }) => input.accept(visitor)?,
+            LogicalPlan::Subquery(Subquery { subquery, .. }) => {
+                subquery.accept(visitor)?
+            }
             LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
                 input.accept(visitor)?
             }
-            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. }) => {
+            LogicalPlan::CreateMemoryTable(CreateMemoryTable { input, .. })
+            | LogicalPlan::CreateView(CreateView { input, .. }) => {
                 input.accept(visitor)?
             }
             LogicalPlan::Extension(extension) => {
@@ -766,6 +788,12 @@ impl LogicalPlan {
                         }
                     },
                     LogicalPlan::Limit(Limit { ref n, .. }) => write!(f, "Limit: {}", n),
+                    LogicalPlan::Offset(Offset { ref offset, .. }) => {
+                        write!(f, "Offset: {}", offset)
+                    }
+                    LogicalPlan::Subquery(Subquery { subquery, .. }) => {
+                        write!(f, "Subquery: {:?}", subquery)
+                    }
                     LogicalPlan::SubqueryAlias(SubqueryAlias { ref alias, .. }) => {
                         write!(f, "SubqueryAlias: {}", alias)
                     }
@@ -779,6 +807,9 @@ impl LogicalPlan {
                         name, ..
                     }) => {
                         write!(f, "CreateMemoryTable: {:?}", name)
+                    }
+                    LogicalPlan::CreateView(CreateView { name, .. }) => {
+                        write!(f, "CreateView: {:?}", name)
                     }
                     LogicalPlan::CreateCatalogSchema(CreateCatalogSchema {
                         schema_name,
@@ -1023,6 +1054,17 @@ pub struct CreateMemoryTable {
     pub if_not_exists: bool,
 }
 
+/// Creates a view.
+#[derive(Clone)]
+pub struct CreateView {
+    /// The table name
+    pub name: String,
+    /// The logical plan
+    pub input: Arc<LogicalPlan>,
+    /// Option to not error if table already exists
+    pub or_replace: bool,
+}
+
 /// Types of files to parse as DataFrames
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FileType {
@@ -1099,6 +1141,15 @@ pub struct Limit {
     pub input: Arc<LogicalPlan>,
 }
 
+/// Adjusts the starting point at which the rest of the expressions begin to effect
+#[derive(Clone)]
+pub struct Offset {
+    /// The offset
+    pub offset: usize,
+    /// The logical plan
+    pub input: Arc<LogicalPlan>,
+}
+
 /// Aggregates its input based on a set of grouping and aggregate
 /// expressions (e.g. SUM).
 #[derive(Clone)]
@@ -1139,6 +1190,38 @@ pub struct Join {
     pub schema: DFSchemaRef,
     /// If null_equals_null is true, null == null else null != null
     pub null_equals_null: bool,
+}
+
+/// Subquery
+#[derive(Clone)]
+pub struct Subquery {
+    /// The subquery
+    pub subquery: Arc<LogicalPlan>,
+}
+
+impl Debug for Subquery {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Subquery: {:?}", self.subquery)
+    }
+}
+
+impl Hash for Subquery {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.finish();
+    }
+
+    fn hash_slice<H: Hasher>(_data: &[Self], state: &mut H)
+    where
+        Self: Sized,
+    {
+        state.finish();
+    }
+}
+
+impl PartialEq for Subquery {
+    fn eq(&self, _other: &Self) -> bool {
+        false
+    }
 }
 
 /// Logical partitioning schemes supported by the repartition operator.

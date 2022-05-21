@@ -19,85 +19,27 @@
 
 use super::optimizer::OptimizerRule;
 use crate::execution::context::ExecutionProps;
-use crate::logical_plan::plan::{
-    Aggregate, Analyze, Extension, Filter, Join, Projection, Sort, SubqueryAlias, Window,
+use datafusion_expr::logical_plan::{
+    Aggregate, Analyze, Extension, Filter, Join, Projection, Sort, Subquery,
+    SubqueryAlias, Window,
 };
 
+use crate::error::{DataFusionError, Result};
 use crate::logical_plan::{
-    build_join_schema, Column, CreateMemoryTable, DFSchemaRef, Expr, ExprVisitable,
-    Limit, LogicalPlan, LogicalPlanBuilder, Operator, Partitioning, Recursion,
-    Repartition, Union, Values,
+    and, build_join_schema, CreateMemoryTable, CreateView, DFSchemaRef, Expr, Limit,
+    LogicalPlan, LogicalPlanBuilder, Offset, Operator, Partitioning, Repartition, Union,
+    Values,
 };
 use crate::prelude::lit;
 use crate::scalar::ScalarValue;
-use crate::{
-    error::{DataFusionError, Result},
-    logical_plan::ExpressionVisitor,
-};
 use datafusion_common::DFSchema;
-use std::{collections::HashSet, sync::Arc};
+use datafusion_expr::expr::GroupingSet;
+use std::sync::Arc;
 
 const CASE_EXPR_MARKER: &str = "__DATAFUSION_CASE_EXPR__";
 const CASE_ELSE_MARKER: &str = "__DATAFUSION_CASE_ELSE__";
 const WINDOW_PARTITION_MARKER: &str = "__DATAFUSION_WINDOW_PARTITION__";
 const WINDOW_SORT_MARKER: &str = "__DATAFUSION_WINDOW_SORT__";
-
-/// Recursively walk a list of expression trees, collecting the unique set of columns
-/// referenced in the expression
-pub fn exprlist_to_columns(expr: &[Expr], accum: &mut HashSet<Column>) -> Result<()> {
-    for e in expr {
-        expr_to_columns(e, accum)?;
-    }
-    Ok(())
-}
-
-/// Recursively walk an expression tree, collecting the unique set of column names
-/// referenced in the expression
-struct ColumnNameVisitor<'a> {
-    accum: &'a mut HashSet<Column>,
-}
-
-impl ExpressionVisitor for ColumnNameVisitor<'_> {
-    fn pre_visit(self, expr: &Expr) -> Result<Recursion<Self>> {
-        match expr {
-            Expr::Column(qc) => {
-                self.accum.insert(qc.clone());
-            }
-            Expr::ScalarVariable(_, var_names) => {
-                self.accum.insert(Column::from_name(var_names.join(".")));
-            }
-            Expr::Alias(_, _)
-            | Expr::Literal(_)
-            | Expr::BinaryExpr { .. }
-            | Expr::Not(_)
-            | Expr::IsNotNull(_)
-            | Expr::IsNull(_)
-            | Expr::Negative(_)
-            | Expr::Between { .. }
-            | Expr::Case { .. }
-            | Expr::Cast { .. }
-            | Expr::TryCast { .. }
-            | Expr::Sort { .. }
-            | Expr::ScalarFunction { .. }
-            | Expr::ScalarUDF { .. }
-            | Expr::WindowFunction { .. }
-            | Expr::AggregateFunction { .. }
-            | Expr::AggregateUDF { .. }
-            | Expr::InList { .. }
-            | Expr::Wildcard
-            | Expr::QualifiedWildcard { .. }
-            | Expr::GetIndexedField { .. } => {}
-        }
-        Ok(Recursion::Continue(self))
-    }
-}
-
-/// Recursively walk an expression tree, collecting the unique set of columns
-/// referenced in the expression
-pub fn expr_to_columns(expr: &Expr, accum: &mut HashSet<Column>) -> Result<()> {
-    expr.accept(ColumnNameVisitor { accum })?;
-    Ok(())
-}
 
 /// Convenience rule for writing optimizers: recursively invoke
 /// optimize on plan's children and then return a node of the same
@@ -223,6 +165,12 @@ pub fn from_plan(
             let right = &inputs[1];
             LogicalPlanBuilder::from(left).cross_join(right)?.build()
         }
+        LogicalPlan::Subquery(_) => {
+            let subquery = LogicalPlanBuilder::from(inputs[0].clone()).build()?;
+            Ok(LogicalPlan::Subquery(Subquery {
+                subquery: Arc::new(subquery),
+            }))
+        }
         LogicalPlan::SubqueryAlias(SubqueryAlias { alias, .. }) => {
             let schema = inputs[0].schema().as_ref().clone().into();
             let schema =
@@ -237,6 +185,10 @@ pub fn from_plan(
             n: *n,
             input: Arc::new(inputs[0].clone()),
         })),
+        LogicalPlan::Offset(Offset { offset, .. }) => Ok(LogicalPlan::Offset(Offset {
+            offset: *offset,
+            input: Arc::new(inputs[0].clone()),
+        })),
         LogicalPlan::CreateMemoryTable(CreateMemoryTable {
             name,
             if_not_exists,
@@ -245,6 +197,13 @@ pub fn from_plan(
             input: Arc::new(inputs[0].clone()),
             name: name.clone(),
             if_not_exists: *if_not_exists,
+        })),
+        LogicalPlan::CreateView(CreateView {
+            name, or_replace, ..
+        }) => Ok(LogicalPlan::CreateView(CreateView {
+            input: Arc::new(inputs[0].clone()),
+            name: name.clone(),
+            or_replace: *or_replace,
         })),
         LogicalPlan::Extension(e) => Ok(LogicalPlan::Extension(Extension {
             node: e.node.from_template(expr, inputs),
@@ -313,6 +272,13 @@ pub fn expr_sub_expressions(expr: &Expr) -> Result<Vec<Expr>> {
         | Expr::ScalarUDF { args, .. }
         | Expr::AggregateFunction { args, .. }
         | Expr::AggregateUDF { args, .. } => Ok(args.clone()),
+        Expr::GroupingSet(grouping_set) => match grouping_set {
+            GroupingSet::Rollup(exprs) => Ok(exprs.clone()),
+            GroupingSet::Cube(exprs) => Ok(exprs.clone()),
+            GroupingSet::GroupingSets(_) => Err(DataFusionError::Plan(
+                "GroupingSets are not supported yet".to_string(),
+            )),
+        },
         Expr::WindowFunction {
             args,
             partition_by,
@@ -363,6 +329,9 @@ pub fn expr_sub_expressions(expr: &Expr) -> Result<Vec<Expr>> {
             }
             Ok(expr_list)
         }
+        Expr::Exists { .. } => Ok(vec![]),
+        Expr::InSubquery { expr, .. } => Ok(vec![expr.as_ref().to_owned()]),
+        Expr::ScalarSubquery(_) => Ok(vec![]),
         Expr::Wildcard { .. } => Err(DataFusionError::Internal(
             "Wildcard expressions are not valid in a logical query plan".to_owned(),
         )),
@@ -445,6 +414,17 @@ pub fn rewrite_expression(expr: &Expr, expressions: &[Expr]) -> Result<Expr> {
             fun: fun.clone(),
             args: expressions.to_vec(),
         }),
+        Expr::GroupingSet(grouping_set) => match grouping_set {
+            GroupingSet::Rollup(_exprs) => {
+                Ok(Expr::GroupingSet(GroupingSet::Rollup(expressions.to_vec())))
+            }
+            GroupingSet::Cube(_exprs) => {
+                Ok(Expr::GroupingSet(GroupingSet::Rollup(expressions.to_vec())))
+            }
+            GroupingSet::GroupingSets(_) => Err(DataFusionError::Plan(
+                "GroupingSets are not supported yet".to_string(),
+            )),
+        },
         Expr::Case { .. } => {
             let mut base_expr: Option<Box<Expr>> = None;
             let mut when_then: Vec<(Box<Expr>, Box<Expr>)> = vec![];
@@ -497,6 +477,9 @@ pub fn rewrite_expression(expr: &Expr, expressions: &[Expr]) -> Result<Expr> {
         Expr::Column(_)
         | Expr::Literal(_)
         | Expr::InList { .. }
+        | Expr::Exists { .. }
+        | Expr::InSubquery { .. }
+        | Expr::ScalarSubquery(_)
         | Expr::ScalarVariable(_, _) => Ok(expr.clone()),
         Expr::Sort {
             asc, nulls_first, ..
@@ -540,11 +523,48 @@ pub fn rewrite_expression(expr: &Expr, expressions: &[Expr]) -> Result<Expr> {
     }
 }
 
+/// converts "A AND B AND C" => [A, B, C]
+pub fn split_conjunction<'a>(predicate: &'a Expr, predicates: &mut Vec<&'a Expr>) {
+    match predicate {
+        Expr::BinaryExpr {
+            right,
+            op: Operator::And,
+            left,
+        } => {
+            split_conjunction(left, predicates);
+            split_conjunction(right, predicates);
+        }
+        Expr::Alias(expr, _) => {
+            split_conjunction(expr, predicates);
+        }
+        other => predicates.push(other),
+    }
+}
+
+/// returns a new [LogicalPlan] that wraps `plan` in a [LogicalPlan::Filter] with
+/// its predicate be all `predicates` ANDed.
+pub fn add_filter(plan: LogicalPlan, predicates: &[&Expr]) -> LogicalPlan {
+    // reduce filters to a single filter with an AND
+    let predicate = predicates
+        .iter()
+        .skip(1)
+        .fold(predicates[0].clone(), |acc, predicate| {
+            and(acc, (*predicate).to_owned())
+        });
+
+    LogicalPlan::Filter(Filter {
+        predicate,
+        input: Arc::new(plan),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::logical_plan::col;
     use arrow::datatypes::DataType;
+    use datafusion_common::Column;
+    use datafusion_expr::utils::expr_to_columns;
     use std::collections::HashSet;
 
     #[test]

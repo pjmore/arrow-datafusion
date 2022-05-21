@@ -29,6 +29,7 @@ use crate::logical_plan::{
 use crate::optimizer::optimizer::OptimizerRule;
 use crate::optimizer::utils;
 use arrow::datatypes::DataType;
+use datafusion_expr::expr::GroupingSet;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -216,12 +217,15 @@ fn optimize(plan: &LogicalPlan, execution_props: &ExecutionProps) -> Result<Logi
         | LogicalPlan::TableScan { .. }
         | LogicalPlan::Values(_)
         | LogicalPlan::EmptyRelation(_)
+        | LogicalPlan::Subquery(_)
         | LogicalPlan::SubqueryAlias(_)
         | LogicalPlan::Limit(_)
+        | LogicalPlan::Offset(_)
         | LogicalPlan::CreateExternalTable(_)
         | LogicalPlan::Explain { .. }
         | LogicalPlan::Analyze { .. }
         | LogicalPlan::CreateMemoryTable(_)
+        | LogicalPlan::CreateView(_)
         | LogicalPlan::CreateCatalogSchema(_)
         | LogicalPlan::CreateCatalog(_)
         | LogicalPlan::DropTable(_)
@@ -459,6 +463,17 @@ impl ExprIdentifierVisitor<'_> {
                 desc.push_str("InList-");
                 desc.push_str(&negated.to_string());
             }
+            Expr::Exists { negated, .. } => {
+                desc.push_str("Exists-");
+                desc.push_str(&negated.to_string());
+            }
+            Expr::InSubquery { negated, .. } => {
+                desc.push_str("InSubquery-");
+                desc.push_str(&negated.to_string());
+            }
+            Expr::ScalarSubquery(_) => {
+                desc.push_str("ScalarSubquery-");
+            }
             Expr::Wildcard => {
                 desc.push_str("Wildcard-");
             }
@@ -470,6 +485,33 @@ impl ExprIdentifierVisitor<'_> {
                 desc.push_str("GetIndexedField-");
                 desc.push_str(&key.to_string());
             }
+            Expr::GroupingSet(grouping_set) => match grouping_set {
+                GroupingSet::Rollup(exprs) => {
+                    desc.push_str("Rollup");
+                    for expr in exprs {
+                        desc.push('-');
+                        desc.push_str(&Self::desc_expr(expr));
+                    }
+                }
+                GroupingSet::Cube(exprs) => {
+                    desc.push_str("Cube");
+                    for expr in exprs {
+                        desc.push('-');
+                        desc.push_str(&Self::desc_expr(expr));
+                    }
+                }
+                GroupingSet::GroupingSets(lists_of_exprs) => {
+                    desc.push_str("GroupingSets");
+                    for exprs in lists_of_exprs {
+                        desc.push('(');
+                        for expr in exprs {
+                            desc.push('-');
+                            desc.push_str(&Self::desc_expr(expr));
+                        }
+                        desc.push(')');
+                    }
+                }
+            },
         }
 
         desc

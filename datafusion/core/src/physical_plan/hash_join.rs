@@ -34,9 +34,7 @@ use std::{sync::Arc};
 use std::{any::Any, usize};
 use std::{time::Instant, vec};
 
-use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryStreamExt};
-use tokio::sync::Mutex;
+use futures::{ready, Stream, StreamExt, TryStreamExt};
 
 use arrow::array::{new_null_array, Array};
 use arrow::datatypes::DataType;
@@ -55,13 +53,13 @@ use hashbrown::raw::RawTable;
 use super::{
     coalesce_partitions::CoalescePartitionsExec,
     expressions::PhysicalSortExpr,
-    join_utils::{build_join_schema, check_join_is_valid, ColumnIndex, JoinOn, JoinSide},  hash_utils::create_hashes_chunked,
+    join_utils::{build_join_schema, check_join_is_valid, ColumnIndex, JoinOn, JoinSide},  hash_utils::{create_hashes_chunked, create_hashes},
 };
 use super::{
     expressions::Column,
     metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet},
 };
-use super::{hash_utils::create_hashes, Statistics};
+use super::{Statistics};
 use crate::error::{DataFusionError, Result};
 use crate::logical_plan::JoinType;
 
@@ -74,8 +72,11 @@ use crate::arrow::datatypes::TimeUnit;
 use crate::execution::context::TaskContext;
 use crate::physical_plan::coalesce_batches::concat_batches;
 use crate::physical_plan::PhysicalExpr;
+
+use crate::physical_plan::join_utils::{OnceAsync, OnceFut};
 use log::debug;
 use std::fmt;
+use std::task::Poll;
 
 // Maps a `u64` hash value based on the left ["on" values] to a list of indices with this key's value.
 //
@@ -97,9 +98,7 @@ impl fmt::Debug for JoinHashMap {
     }
 }
 
-
-
-type JoinLeftData = Arc<(JoinHashMap, RecordBatch)>;
+type JoinLeftData = (JoinHashMap, RecordBatch);
 
 /// join execution plan executes partitions in parallel and combines them into a set of
 /// partitions.
@@ -115,8 +114,8 @@ pub struct HashJoinExec {
     join_type: JoinType,
     /// The schema once the join is applied
     schema: SchemaRef,
-    /// Build-side
-    build_side: Arc<Mutex<Option<JoinLeftData>>>,
+    /// Build-side data
+    left_fut: OnceAsync<JoinLeftData>,
     /// Shares the `RandomState` for the hashing algorithm
     random_state: RandomState,
     /// Partitioning mode to use
@@ -210,7 +209,7 @@ impl HashJoinExec {
             on,
             join_type: *join_type,
             schema: Arc::new(schema),
-            build_side: Arc::new(Mutex::new(None)),
+            left_fut: Default::default(),
             random_state,
             mode: partition_mode,
             metrics: ExecutionPlanMetricsSet::new(),
@@ -250,7 +249,6 @@ impl HashJoinExec {
     }
 }
 
-#[async_trait]
 impl ExecutionPlan for HashJoinExec {
     fn as_any(&self) -> &dyn Any {
         self
@@ -290,156 +288,48 @@ impl ExecutionPlan for HashJoinExec {
         false
     }
 
-    async fn execute(
+    fn execute(
         &self,
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let on_left = self.on.iter().map(|on| on.0.clone()).collect::<Vec<_>>();
-        // we only want to compute the build side once for PartitionMode::CollectLeft
-        let left_data = {
-            match self.mode {
-                PartitionMode::CollectLeft => {
-                    let mut build_side = self.build_side.lock().await;
+        let on_right = self.on.iter().map(|on| on.1.clone()).collect::<Vec<_>>();
 
-                    match build_side.as_ref() {
-                        Some(stream) => stream.clone(),
-                        None => {
-                            let start = Instant::now();
-
-                            // merge all left parts into a single stream
-                            let merge = CoalescePartitionsExec::new(self.left.clone());
-                            let stream = merge.execute(0, context.clone()).await?;
-
-                            // This operation performs 2 steps at once:
-                            // 1. creates a [JoinHashMap] of all batches from the stream
-                            // 2. stores the batches in a vector.
-                            let initial = (0, Vec::new());
-                            let (num_rows, batches) = stream
-                                .try_fold(initial, |mut acc, batch| async {
-                                    acc.0 += batch.num_rows();
-                                    acc.1.push(batch);
-                                    Ok(acc)
-                                })
-                                .await?;
-                            let mut hashmap =
-                                JoinHashMap(RawTable::with_capacity(num_rows));
-                            let mut hashes_buffer = Vec::new();
-                            let mut offset = 0;
-                            for batch in batches.iter() {
-                                hashes_buffer.clear();
-                                hashes_buffer.resize(batch.num_rows(), 0);
-                                update_hash(
-                                    &on_left,
-                                    batch,
-                                    &mut hashmap,
-                                    offset,
-                                    &self.random_state,
-                                    &mut hashes_buffer,
-                                )?;
-                                offset += batch.num_rows();
-                            }
-                            // Merge all batches into a single batch, so we
-                            // can directly index into the arrays
-                            let single_batch =
-                                concat_batches(&self.left.schema(), &batches, num_rows)?;
-
-                            let left_side = Arc::new((hashmap, single_batch));
-
-                            *build_side = Some(left_side.clone());
-
-                            debug!(
-                                "Built build-side of hash join containing {} rows in {} ms",
-                                num_rows,
-                                start.elapsed().as_millis()
-                            );
-
-                            left_side
-                        }
-                    }
-                }
-                PartitionMode::Partitioned => {
-                    let start = Instant::now();
-
-                    // Load 1 partition of left side in memory
-                    let stream = self.left.execute(partition, context.clone()).await?;
-
-                    // This operation performs 2 steps at once:
-                    // 1. creates a [JoinHashMap] of all batches from the stream
-                    // 2. stores the batches in a vector.
-                    let initial = (0, Vec::new());
-                    let (num_rows, batches) = stream
-                        .try_fold(initial, |mut acc, batch| async {
-                            acc.0 += batch.num_rows();
-                            acc.1.push(batch);
-                            Ok(acc)
-                        })
-                        .await?;
-                    let mut hashmap = JoinHashMap(RawTable::with_capacity(num_rows));
-                    let mut hashes_buffer = Vec::new();
-                    let mut offset = 0;
-                    for batch in batches.iter() {
-                        hashes_buffer.clear();
-                        hashes_buffer.resize(batch.num_rows(), 0);
-                        update_hash(
-                            &on_left,
-                            batch,
-                            &mut hashmap,
-                            offset,
-                            &self.random_state,
-                            &mut hashes_buffer,
-                        )?;
-                        offset += batch.num_rows();
-                    }
-                    // Merge all batches into a single batch, so we
-                    // can directly index into the arrays
-                    let single_batch =
-                        concat_batches(&self.left.schema(), &batches, num_rows)?;
-
-                    let left_side = Arc::new((hashmap, single_batch));
-
-                    debug!(
-                        "Built build-side {} of hash join containing {} rows in {} ms",
-                        partition,
-                        num_rows,
-                        start.elapsed().as_millis()
-                    );
-
-                    left_side
-                }
-            }
+        let left_fut = match self.mode {
+            PartitionMode::CollectLeft => self.left_fut.once(|| {
+                collect_left_input(
+                    self.random_state.clone(),
+                    self.left.clone(),
+                    on_left.clone(),
+                    context.clone(),
+                )
+            }),
+            PartitionMode::Partitioned => OnceFut::new(partitioned_left_input(
+                partition,
+                self.random_state.clone(),
+                self.left.clone(),
+                on_left.clone(),
+                context.clone(),
+            )),
         };
 
         // we have the batches and the hash map with their keys. We can how create a stream
         // over the right that uses this information to issue new batches.
-
-        let right_stream = self.right.execute(partition, context.clone()).await?;
-        let on_right = self.on.iter().map(|on| on.1.clone()).collect::<Vec<_>>();
-
-        let num_rows = left_data.1.num_rows();
-        let visited_left_side = match self.join_type {
-            JoinType::Left | JoinType::Full | JoinType::Semi | JoinType::Anti => {
-                let mut buffer = BooleanBufferBuilder::new(num_rows);
-
-                buffer.append_n(num_rows, false);
-
-                buffer
-            }
-            JoinType::Inner | JoinType::Right => BooleanBufferBuilder::new(0),
-        };
-        Ok(Box::pin(HashJoinStream::try_new(
-            self.schema.clone(),
+        let right_stream = self.right.execute(partition, context)?;
+        let stream = HashJoinStream::try_new(
+            self.schema(),
             on_left,
             on_right,
             self.join_type,
-            left_data,
+            left_fut,
             right_stream,
             self.column_indices.clone(),
             self.random_state.clone(),
-            visited_left_side,
             HashJoinMetrics::new(partition, &self.metrics),
-            self.null_equals_null,
-        )?))
+            self.null_equals_null
+        )?;
+        Ok(Box::pin(stream))
     }
 
     fn fmt_as(
@@ -468,6 +358,116 @@ impl ExecutionPlan for HashJoinExec {
         // - `A LEFT JOIN B ON A.col=B.col` with `COUNT_DISTINCT(B.col)=COUNT(B.col)`
         Statistics::default()
     }
+}
+
+async fn collect_left_input(
+    random_state: RandomState,
+    left: Arc<dyn ExecutionPlan>,
+    on_left: Vec<Column>,
+    context: Arc<TaskContext>,
+) -> Result<JoinLeftData> {
+    let schema = left.schema();
+    let start = Instant::now();
+
+    // merge all left parts into a single stream
+    let merge = CoalescePartitionsExec::new(left);
+    let stream = merge.execute(0, context)?;
+
+    // This operation performs 2 steps at once:
+    // 1. creates a [JoinHashMap] of all batches from the stream
+    // 2. stores the batches in a vector.
+    let initial = (0, Vec::new());
+    let (num_rows, batches) = stream
+        .try_fold(initial, |mut acc, batch| async {
+            acc.0 += batch.num_rows();
+            acc.1.push(batch);
+            Ok(acc)
+        })
+        .await?;
+
+    let mut hashmap = JoinHashMap(RawTable::with_capacity(num_rows));
+    let mut hashes_buffer = Vec::new();
+    let mut offset = 0;
+    for batch in batches.iter() {
+        hashes_buffer.clear();
+        hashes_buffer.resize(batch.num_rows(), 0);
+        update_hash(
+            &on_left,
+            batch,
+            &mut hashmap,
+            offset,
+            &random_state,
+            &mut hashes_buffer,
+        )?;
+        offset += batch.num_rows();
+    }
+    // Merge all batches into a single batch, so we
+    // can directly index into the arrays
+    let single_batch = concat_batches(&schema, &batches, num_rows)?;
+
+    debug!(
+        "Built build-side of hash join containing {} rows in {} ms",
+        num_rows,
+        start.elapsed().as_millis()
+    );
+
+    Ok((hashmap, single_batch))
+}
+
+async fn partitioned_left_input(
+    partition: usize,
+    random_state: RandomState,
+    left: Arc<dyn ExecutionPlan>,
+    on_left: Vec<Column>,
+    context: Arc<TaskContext>,
+) -> Result<JoinLeftData> {
+    let schema = left.schema();
+
+    let start = Instant::now();
+
+    // Load 1 partition of left side in memory
+    let stream = left.execute(partition, context.clone())?;
+
+    // This operation performs 2 steps at once:
+    // 1. creates a [JoinHashMap] of all batches from the stream
+    // 2. stores the batches in a vector.
+    let initial = (0, Vec::new());
+    let (num_rows, batches) = stream
+        .try_fold(initial, |mut acc, batch| async {
+            acc.0 += batch.num_rows();
+            acc.1.push(batch);
+            Ok(acc)
+        })
+        .await?;
+
+    let mut hashmap = JoinHashMap(RawTable::with_capacity(num_rows));
+    let mut hashes_buffer = Vec::new();
+    let mut offset = 0;
+    for batch in batches.iter() {
+        hashes_buffer.clear();
+        hashes_buffer.resize(batch.num_rows(), 0);
+        update_hash(
+            &on_left,
+            batch,
+            &mut hashmap,
+            offset,
+            &random_state,
+            &mut hashes_buffer,
+        )?;
+        offset += batch.num_rows();
+    }
+    // Merge all batches into a single batch, so we
+    // can directly index into the arrays
+    let single_batch = concat_batches(&schema, &batches, num_rows)?;
+
+    debug!(
+        "Built build-side {} of hash join containing {} rows in {} ms",
+        partition,
+        num_rows,
+        start.elapsed().as_millis()
+    );
+
+    Ok((hashmap, single_batch))
 }
 
 /// Updates `hash` with new entries from [RecordBatch] evaluated against the expressions `on`,
@@ -509,11 +509,13 @@ fn update_hash(
 /// A stream that issues [RecordBatch]es as they arrive from the right  of the join.
 struct HashJoinStream {
     //Describes what kind of join is being done on what columns
-    join_data: JoinData,
-    /// right side of the join
-    right: SendableRecordBatchStream,
+    join_data: JoinData,    
+    /// future for data from left side
+    left_fut: OnceFut<JoinLeftData>,
     /// Keeps track of the left side rows whether they are visited
-    visited_left_side: BooleanBufferBuilder,
+    visited_left_side: Option<BooleanBufferBuilder>,
+    /// right
+    right: SendableRecordBatchStream,
     /// There is nothing to process anymore and left side is processed in case of left join
     is_exhausted: bool,
     /// Metrics
@@ -528,11 +530,10 @@ impl HashJoinStream {
         on_left: Vec<Column>,
         on_right: Vec<Column>,
         join_type: JoinType,
-        left_data: JoinLeftData,
+        left_fut: OnceFut<(JoinHashMap, RecordBatch)>,
         right: SendableRecordBatchStream,
         column_indices: Vec<ColumnIndex>,
         random_state: RandomState,
-        visited_left_side: BooleanBufferBuilder,
         join_metrics: HashJoinMetrics,
         null_equals_null: bool,
     ) -> Result<Self> {
@@ -543,7 +544,6 @@ impl HashJoinStream {
                 on_left,
                 on_right,
                 join_type,
-                left_data,
                 random_state,
                 column_indices,
                 null_equals_null,
@@ -562,7 +562,8 @@ impl HashJoinStream {
                 }
             },
             right,
-            visited_left_side,
+            left_fut,
+            visited_left_side: None,
             is_exhausted: false,
             join_metrics,
         })
@@ -582,6 +583,7 @@ impl RecordBatchStream for HashJoinStream {
 /// *
 fn build_batch_from_indices(
     join_data: &JoinData,
+    left: &JoinLeftData,
     right: &RecordBatch,
     left_indices: UInt64Array,
     right_indices: UInt32Array,
@@ -593,7 +595,7 @@ fn build_batch_from_indices(
     for column_index in &join_data.column_indices {
         let array = match column_index.side {
             JoinSide::Left => {
-                let array = join_data.left_data.1.column(column_index.index);
+                let array = left.1.column(column_index.index);
                 if array.is_empty() || left_indices.null_count() == left_indices.len() {
                     // Outer join would generate a null index when finding no match at our side.
                     // Therefore, it's possible we are empty but need to populate an n-length null array,
@@ -1188,14 +1190,14 @@ fn produce_from_matched(
 struct JoinData{
     /// Input schema
     schema: Arc<Schema>,
+    /// columns from the left used to compute the hash
+    on_left: Vec<Column>,
     /// columns from the right used to compute the hash
     on_right: Vec<Column>,
     /// type of the join
     join_type: JoinType,
     /// information from the left
-    left_data: JoinLeftData,
-    /// data for the join columns from the left side of the join
-    left_join_values: Vec<Arc<dyn Array>>,
+    left_join_values: Option<Vec<Arc<dyn Array>>>,
     /// Random state used for hashing initialization
     random_state: RandomState,
     /// Information of index and left / right placement of columns
@@ -1208,15 +1210,14 @@ struct JoinData{
 
 
 impl JoinData{
-    fn try_new(schema: Arc<Schema>, on_left: Vec<Column>, on_right: Vec<Column>, join_type: JoinType, left_data: JoinLeftData,random_state: RandomState,column_indices: Vec<ColumnIndex>,null_equals_null: bool)->Result<Self>{
-        let left_join_values = Self::left_join_values(&on_left, &left_data)?;
+    fn try_new(schema: Arc<Schema>, on_left: Vec<Column>, on_right: Vec<Column>, join_type: JoinType, random_state: RandomState,column_indices: Vec<ColumnIndex>,null_equals_null: bool)->Result<Self>{
         Ok(
             Self{
                 schema,
+                on_left,
                 on_right,
                 join_type,
-                left_data,
-                left_join_values,
+                left_join_values: None,
                 random_state,
                 column_indices,
                 null_equals_null,
@@ -1243,30 +1244,139 @@ impl JoinData{
     }
 }
 
-fn build_batch_new<const N: usize>(right: &RecordBatch, join_data: &JoinData, buffers: &mut HashJoinBuffers<N>)->ArrowResult<(RecordBatch, UInt64Array)>{
+fn build_batch_new<const N: usize>(right: &RecordBatch,left_data:&(JoinHashMap, RecordBatch), join_data: &mut JoinData, buffers: &mut HashJoinBuffers<N>)->ArrowResult<(RecordBatch, UInt64Array)>{
     let keys_values = join_data.keys_values(right)?;
+    let left_join_values = if join_data.left_join_values.is_none(){
+        join_data.left_join_values = Some(JoinData::left_join_values(&join_data.on_left, left_data)?);
+        join_data.left_join_values.as_ref().unwrap()
+    }else{
+        join_data.left_join_values.as_ref().unwrap()
+    };
+
     let (left_indices, right_indices) = match join_data.join_type{
         JoinType::Left |
-        JoinType::Inner => build_join_indexes_inner_or_left(&join_data.left_join_values, &join_data.left_data.0, &keys_values, &join_data.random_state, buffers, join_data.null_equals_null)?,
+        JoinType::Inner => build_join_indexes_inner_or_left(&left_join_values, &left_data.0, &keys_values, &join_data.random_state, buffers, join_data.null_equals_null)?,
         JoinType::Right |
-        JoinType::Full => build_join_indexes_full_or_right(&join_data.left_join_values, &join_data.left_data.0, &keys_values, &join_data.random_state, buffers, join_data.null_equals_null)?,
+        JoinType::Full => build_join_indexes_full_or_right(&left_join_values, &left_data.0, &keys_values, &join_data.random_state, buffers, join_data.null_equals_null)?,
         JoinType::Semi| 
         JoinType::Anti =>{
-            let left_indices = build_join_indexes_semi_or_anti(&join_data.left_join_values, &join_data.left_data.0, &keys_values, &join_data.random_state, buffers, join_data.null_equals_null)?;
+            let left_indices = build_join_indexes_semi_or_anti(&left_join_values, &left_data.0, &keys_values, &join_data.random_state, buffers, join_data.null_equals_null)?;
             return Ok((RecordBatch::new_empty(join_data.schema.clone()), left_indices));
         } 
     };
     //println!("Left: \n{}", arrow::util::pretty::pretty_format_batches(&[join_data.left_data.1.clone()]).unwrap());
     //println!("Right: \n{}", arrow::util::pretty::pretty_format_batches(&[right.clone()]).unwrap());
-    build_batch_from_indices(join_data, right, left_indices, right_indices)
+    build_batch_from_indices(join_data, left_data, right, left_indices, right_indices)
 }
 
 
 impl HashJoinStream{
-    fn build_batch(&mut self, right: &RecordBatch)->ArrowResult<(RecordBatch, UInt64Array)>{
-        let join_data = &self.join_data;
+    fn build_batch(&mut self, right: &RecordBatch, left_data: &(JoinHashMap, RecordBatch))->ArrowResult<(RecordBatch, UInt64Array)>{
+        let join_data = &mut self.join_data;
         let buffers = &mut self.join_buffers;
-        build_batch_new(right, join_data, buffers)
+        build_batch_new(right, left_data, join_data, buffers)
+    }
+}
+
+
+impl HashJoinStream {
+    /// Separate implementation function that unpins the [`HashJoinStream`] so
+    /// that partial borrows work correctly
+    fn poll_next_impl(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<ArrowResult<RecordBatch>>> {
+        let left_data = match ready!(self.left_fut.get(cx)) {
+            Ok(left_data) => left_data,
+            Err(e) => return Poll::Ready(Some(Err(e))),
+        };
+
+        let visited_left_side = self.visited_left_side.get_or_insert_with(|| {
+            let num_rows = left_data.1.num_rows();
+            match self.join_data.join_type {
+                JoinType::Left | JoinType::Full | JoinType::Semi | JoinType::Anti => {
+                    let mut buffer = BooleanBufferBuilder::new(num_rows);
+
+                    buffer.append_n(num_rows, false);
+
+                    buffer
+                }
+                JoinType::Inner | JoinType::Right => BooleanBufferBuilder::new(0),
+            }
+        });
+
+        self.right
+        .poll_next_unpin(cx)
+        .map(|maybe_batch| match maybe_batch {
+            Some(Ok(batch)) => {
+                let timer = self.join_metrics.join_time.timer();
+                let join_data = &mut self.join_data;
+                let buffers = &mut self.join_buffers;
+                
+                let result = build_batch_new(&batch, left_data, join_data, buffers);
+                
+                self.join_metrics.input_batches.add(1);
+                self.join_metrics.input_rows.add(batch.num_rows());
+                if let Ok((ref batch, ref left_side)) = result {
+                    timer.done();
+                    self.join_metrics.output_batches.add(1);
+                    self.join_metrics.output_rows.add(batch.num_rows());
+
+                    match self.join_data.join_type {
+                        JoinType::Left
+                        | JoinType::Full
+                        | JoinType::Semi
+                        | JoinType::Anti => {
+                            left_side.iter().flatten().for_each(|x| {
+                                visited_left_side.set_bit(x as usize, true);
+                            });
+                        }
+                        JoinType::Inner | JoinType::Right => {}
+                    }
+                }
+                Some(result.map(|x| x.0))
+            }
+            other => {
+                let timer = self.join_metrics.join_time.timer();
+                // For the left join, produce rows for unmatched rows
+                match self.join_data.join_type {
+                    JoinType::Left
+                    | JoinType::Full
+                    | JoinType::Semi
+                    | JoinType::Anti
+                        if !self.is_exhausted =>
+                    {
+                        let result = produce_from_matched(
+                            visited_left_side,
+                            &self.join_data.schema,
+                            &self.join_data.column_indices,
+                            left_data,
+                            self.join_data.join_type != JoinType::Semi,
+                        );
+                        if let Ok(ref batch) = result {
+                            self.join_metrics.input_batches.add(1);
+                            self.join_metrics.input_rows.add(batch.num_rows());
+                            if let Ok(ref batch) = result {
+                                self.join_metrics.output_batches.add(1);
+                                self.join_metrics.output_rows.add(batch.num_rows());
+                            }
+                        }
+                        timer.done();
+                        self.is_exhausted = true;
+                        return Some(result);
+                    }
+                    JoinType::Left
+                    | JoinType::Full
+                    | JoinType::Semi
+                    | JoinType::Anti
+                    | JoinType::Inner
+                    | JoinType::Right => {}
+                }
+
+                other
+            }
+        })
+            
     }
 }
 
@@ -1277,76 +1387,7 @@ impl Stream for HashJoinStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.right
-            .poll_next_unpin(cx)
-            .map(|maybe_batch| match maybe_batch {
-                Some(Ok(batch)) => {
-                    let start = self.join_metrics.join_time.clone();
-                    let timer = start.timer();
-                    let result = self.build_batch(&batch);
-                    
-                    self.join_metrics.input_batches.add(1);
-                    self.join_metrics.input_rows.add(batch.num_rows());
-                    if let Ok((ref batch, ref left_side)) = result {
-                        timer.done();
-                        self.join_metrics.output_batches.add(1);
-                        self.join_metrics.output_rows.add(batch.num_rows());
-
-                        match self.join_data.join_type {
-                            JoinType::Left
-                            | JoinType::Full
-                            | JoinType::Semi
-                            | JoinType::Anti => {
-                                left_side.iter().flatten().for_each(|x| {
-                                    self.visited_left_side.set_bit(x as usize, true);
-                                });
-                            }
-                            JoinType::Inner | JoinType::Right => {}
-                        }
-                    }
-                    Some(result.map(|x| x.0))
-                }
-                other => {
-                    let timer = self.join_metrics.join_time.timer();
-                    // For the left join, produce rows for unmatched rows
-                    match self.join_data.join_type {
-                        JoinType::Left
-                        | JoinType::Full
-                        | JoinType::Semi
-                        | JoinType::Anti
-                            if !self.is_exhausted =>
-                        {
-                            let result = produce_from_matched(
-                                &self.visited_left_side,
-                                &self.join_data.schema,
-                                &self.join_data.column_indices,
-                                &self.join_data.left_data,
-                                self.join_data.join_type != JoinType::Semi,
-                            );
-                            if let Ok(ref batch) = result {
-                                self.join_metrics.input_batches.add(1);
-                                self.join_metrics.input_rows.add(batch.num_rows());
-                                if let Ok(ref batch) = result {
-                                    self.join_metrics.output_batches.add(1);
-                                    self.join_metrics.output_rows.add(batch.num_rows());
-                                }
-                            }
-                            timer.done();
-                            self.is_exhausted = true;
-                            return Some(result);
-                        }
-                        JoinType::Left
-                        | JoinType::Full
-                        | JoinType::Semi
-                        | JoinType::Anti
-                        | JoinType::Inner
-                        | JoinType::Right => {}
-                    }
-
-                    other
-                }
-            })
-            
+        self.poll_next_impl(cx)
     }
 }
 
@@ -1402,7 +1443,7 @@ mod tests {
         let join = join(left, right, on, join_type, null_equals_null)?;
         let columns = columns(&join.schema());
 
-        let stream = join.execute(0, context).await?;
+        let stream = join.execute(0, context)?;
         let batches = common::collect(stream).await?;
 
         Ok((columns, batches))
@@ -1447,7 +1488,7 @@ mod tests {
 
         let mut batches = vec![];
         for i in 0..partition_count {
-            let stream = join.execute(i, context.clone()).await?;
+            let stream = join.execute(i, context.clone())?;
             let more_batches = common::collect(stream).await?;
             batches.extend(
                 more_batches
@@ -1726,7 +1767,7 @@ mod tests {
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
         // first part
-        let stream = join.execute(0, task_ctx.clone()).await?;
+        let stream = join.execute(0, task_ctx.clone())?;
         let batches = common::collect(stream).await?;
         assert_eq!(batches.len(), 1);
 
@@ -1740,7 +1781,7 @@ mod tests {
         assert_batches_sorted_eq!(expected, &batches);
 
         // second part
-        let stream = join.execute(1, task_ctx.clone()).await?;
+        let stream = join.execute(1, task_ctx.clone())?;
         let batches = common::collect(stream).await?;
         assert_eq!(batches.len(), 1);
         let expected = vec![
@@ -1793,7 +1834,7 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
-        let stream = join.execute(0, task_ctx).await.unwrap();
+        let stream = join.execute(0, task_ctx).unwrap();
         let batches = common::collect(stream).await.unwrap();
 
         let expected = vec![
@@ -1836,7 +1877,7 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b2", "c2"]);
 
-        let stream = join.execute(0, task_ctx).await.unwrap();
+        let stream = join.execute(0, task_ctx).unwrap();
         let batches = common::collect(stream).await.unwrap();
 
         let expected = vec![
@@ -1877,7 +1918,7 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b1", "c2"]);
 
-        let stream = join.execute(0, task_ctx).await.unwrap();
+        let stream = join.execute(0, task_ctx).unwrap();
         let batches = common::collect(stream).await.unwrap();
 
         let expected = vec![
@@ -1914,7 +1955,7 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b2", "c2"]);
 
-        let stream = join.execute(0, task_ctx).await.unwrap();
+        let stream = join.execute(0, task_ctx).unwrap();
         let batches = common::collect(stream).await.unwrap();
 
         let expected = vec![
@@ -2042,7 +2083,7 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a1", "b1", "c1"]);
 
-        let stream = join.execute(0, task_ctx).await?;
+        let stream = join.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
 
         let expected = vec![
@@ -2083,7 +2124,7 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a1", "b1", "c1"]);
 
-        let stream = join.execute(0, task_ctx).await?;
+        let stream = join.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
 
         let expected = vec![
@@ -2201,7 +2242,7 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a1", "b1", "c1", "a2", "b2", "c2"]);
 
-        let stream = join.execute(0, task_ctx).await?;
+        let stream = join.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
 
         let expected = vec![
@@ -2241,8 +2282,10 @@ mod tests {
             ("b", &vec![0, 0]),
             ("c", &vec![30, 40]),
         );
+         
+        let left_data = (JoinHashMap(hashmap_left), left);
+        
 
-        let left_data = JoinLeftData::new((JoinHashMap(hashmap_left), left));
         const N: usize = 100;
         let mut buffers = Box::new(HashJoinBuffers::<N>{
             hash_buffer: [0; N],
@@ -2304,7 +2347,7 @@ mod tests {
         let columns = columns(&join.schema());
         assert_eq!(columns, vec!["a", "b", "c", "a", "b", "c"]);
 
-        let stream = join.execute(0, task_ctx).await?;
+        let stream = join.execute(0, task_ctx)?;
         let batches = common::collect(stream).await?;
 
         let expected = vec![

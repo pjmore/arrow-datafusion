@@ -38,11 +38,56 @@ fn combine_hashes(l: u64, r: u64) -> u64 {
     hash.wrapping_mul(37).wrapping_add(r)
 }
 
+fn hash_null(random_state: &RandomState, hashes_buffer: &'_ mut [u64], mul_col: bool) {
+    if mul_col {
+        hashes_buffer.iter_mut().for_each(|hash| {
+            // stable hash for null value
+            *hash = combine_hashes(i128::get_hash(&1, random_state), *hash);
+        })
+    } else {
+        hashes_buffer.iter_mut().for_each(|hash| {
+            *hash = i128::get_hash(&1, random_state);
+        })
+    }
+}
+
+fn hash_decimal128<'a>(
+    array: &ArrayRef,
+    random_state: &RandomState,
+    hashes_buffer: &'a mut [u64],
+    mul_col: bool,
+) {
+    let array = array.as_any().downcast_ref::<DecimalArray>().unwrap();
+    if array.null_count() == 0 {
+        if mul_col {
+            for (i, hash) in hashes_buffer.iter_mut().enumerate() {
+                *hash =
+                    combine_hashes(i128::get_hash(&array.value(i), random_state), *hash);
+            }
+        } else {
+            for (i, hash) in hashes_buffer.iter_mut().enumerate() {
+                *hash = i128::get_hash(&array.value(i), random_state);
+            }
+        }
+    } else if mul_col {
+        for (i, hash) in hashes_buffer.iter_mut().enumerate() {
+            if !array.is_null(i) {
+                *hash =
+                    combine_hashes(i128::get_hash(&array.value(i), random_state), *hash);
+            }
+        }
+    } else {
+        for (i, hash) in hashes_buffer.iter_mut().enumerate() {
+            if !array.is_null(i) {
+                *hash = i128::get_hash(&array.value(i), random_state);
+            }
+        }
+    }
+}
 
 
 
 
-const NULL_HASH_VALUE: u64 = 0;
 
 macro_rules! declare_hash_array{
     //This pattern forwards to the next pattern. Filling in the get_hash block. This only works for primitive types with a .to_ne_bytes() method.
@@ -91,11 +136,12 @@ macro_rules! declare_hash_array{
                     offset +=1;
                 }
             }else{
+                let null_hash_val = i128::get_hash(&1, random_state);
                 for chunk in &mut mut_chunks{
                     for i in 0..INTERNAL_HASH_BUFFER_SIZE{
                         let arr_idx = offset as usize +i;
                         hash_buffer[i] = if array.is_null(arr_idx){
-                            NULL_HASH_VALUE                           
+                            null_hash_val                           
                         }else{
                             get_hash(array.value(arr_idx), random_state)
                         };
@@ -113,7 +159,7 @@ macro_rules! declare_hash_array{
                     
                     let arr_idx = offset as usize;
                     let new_hash = if array.is_null(arr_idx){
-                        NULL_HASH_VALUE
+                        null_hash_val
                     }else{
                         get_hash(array.value(arr_idx), random_state)
                     };
@@ -183,6 +229,7 @@ fn create_hashes_dictionary_chunk<K: ArrowDictionaryKeyType, const N: usize, con
         create_hashes(&[dict_values], random_state, hash_cache)?;
     }
     let keys = dict_array.keys().values();
+    let null_hash_value = i128::get_hash(&1,random_state);
     for offset in 0.. num_to_process{
         let idx = (start_idx + offset) as usize;
         let key = keys[idx].to_usize()
@@ -192,9 +239,9 @@ fn create_hashes_dictionary_chunk<K: ArrowDictionaryKeyType, const N: usize, con
                     keys[idx], dict_array.data_type()
                 ))
             })?;
-
+        
         let hash = if dict_array.keys().is_null(idx){
-            NULL_HASH_VALUE
+            null_hash_value
         } else{
             hash_cache[key]
         };
@@ -223,7 +270,39 @@ pub fn create_hashes<'a>(
     for hash in hashes_buffer.iter_mut() {
         *hash = 0
     }
-    return Ok(hashes_buffer);
+    Ok(hashes_buffer)
+}
+
+/// Test version of `create_row_hashes` that produces the same value for
+/// all hashes (to test collisions)
+///
+/// See comments on `hashes_buffer` for more details
+#[cfg(feature = "force_hash_collisions")]
+pub fn create_row_hashes<'a>(
+    _rows: &[Vec<u8>],
+    _random_state: &RandomState,
+    hashes_buffer: &'a mut Vec<u64>,
+) -> Result<&'a mut Vec<u64>> {
+    for hash in hashes_buffer.iter_mut() {
+        *hash = 0
+    }
+    Ok(hashes_buffer)
+}
+
+/// Creates hash values for every row, based on their raw bytes.
+#[cfg(not(feature = "force_hash_collisions"))]
+pub fn create_row_hashes<'a>(
+    rows: &[Vec<u8>],
+    random_state: &RandomState,
+    hashes_buffer: &'a mut Vec<u64>,
+) -> Result<&'a mut Vec<u64>> {
+    for hash in hashes_buffer.iter_mut() {
+        *hash = 0
+    }
+    for (i, hash) in hashes_buffer.iter_mut().enumerate() {
+        *hash = <Vec<u8>>::get_hash(&rows[i], random_state);
+    }
+    Ok(hashes_buffer)
 }
 
 #[cfg(feature="force_hash_collisions")]

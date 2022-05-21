@@ -23,6 +23,7 @@ use super::{
     hash_join::PartitionMode, udaf, union::UnionExec, values::ValuesExec, windows,
 };
 use crate::execution::context::{ExecutionProps, SessionState};
+use crate::logical_expr::utils::generate_sort_key;
 use crate::logical_plan::plan::{
     source_as_provider, Aggregate, EmptyRelation, Filter, Join, Projection, Sort,
     SubqueryAlias, TableScan, Window,
@@ -34,6 +35,7 @@ use crate::logical_plan::{
 };
 use crate::logical_plan::{Limit, Values};
 use crate::physical_optimizer::optimizer::PhysicalOptimizerRule;
+use crate::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use crate::physical_plan::cross_join::CrossJoinExec;
 use crate::physical_plan::explain::ExplainExec;
 use crate::physical_plan::expressions;
@@ -41,7 +43,6 @@ use crate::physical_plan::expressions::{
     CaseExpr, Column, GetIndexedFieldExpr, Literal, PhysicalSortExpr,
 };
 use crate::physical_plan::filter::FilterExec;
-use crate::physical_plan::hash_aggregate::{AggregateMode, HashAggregateExec};
 use crate::physical_plan::hash_join::HashJoinExec;
 use crate::physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
 use crate::physical_plan::projection::ProjectionExec;
@@ -52,7 +53,7 @@ use crate::physical_plan::windows::WindowAggExec;
 use crate::physical_plan::{join_utils, Partitioning};
 use crate::physical_plan::{AggregateExpr, ExecutionPlan, PhysicalExpr, WindowExpr};
 use crate::scalar::ScalarValue;
-use crate::sql::utils::{generate_sort_key, window_expr_common_partition_keys};
+use crate::sql::utils::window_expr_common_partition_keys;
 use crate::variable::VarType;
 use crate::{
     error::{DataFusionError, Result},
@@ -62,6 +63,8 @@ use arrow::compute::SortOptions;
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::{compute::can_cast_types, datatypes::DataType};
 use async_trait::async_trait;
+use datafusion_expr::expr::GroupingSet;
+use datafusion_physical_expr::expressions::DateIntervalExpr;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use log::{debug, trace};
@@ -173,6 +176,37 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
             }
             Ok(format!("{}({})", fun.name, names.join(",")))
         }
+        Expr::GroupingSet(grouping_set) => match grouping_set {
+            GroupingSet::Rollup(exprs) => Ok(format!(
+                "ROLLUP ({})",
+                exprs
+                    .iter()
+                    .map(|e| create_physical_name(e, false))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(", ")
+            )),
+            GroupingSet::Cube(exprs) => Ok(format!(
+                "CUBE ({})",
+                exprs
+                    .iter()
+                    .map(|e| create_physical_name(e, false))
+                    .collect::<Result<Vec<_>>>()?
+                    .join(", ")
+            )),
+            GroupingSet::GroupingSets(lists_of_exprs) => {
+                let mut strings = vec![];
+                for exprs in lists_of_exprs {
+                    let exprs_str = exprs
+                        .iter()
+                        .map(|e| create_physical_name(e, false))
+                        .collect::<Result<Vec<_>>>()?
+                        .join(", ");
+                    strings.push(format!("({})", exprs_str));
+                }
+                Ok(format!("GROUPING SETS ({})", strings.join(", ")))
+            }
+        },
+
         Expr::InList {
             expr,
             list,
@@ -186,6 +220,15 @@ fn create_physical_name(e: &Expr, is_first_expr: bool) -> Result<String> {
                 Ok(format!("{} IN ({:?})", expr, list))
             }
         }
+        Expr::Exists { .. } => Err(DataFusionError::NotImplemented(
+            "EXISTS is not yet supported in the physical plan".to_string(),
+        )),
+        Expr::InSubquery { .. } => Err(DataFusionError::NotImplemented(
+            "IN subquery is not yet supported in the physical plan".to_string(),
+        )),
+        Expr::ScalarSubquery(_) => Err(DataFusionError::NotImplemented(
+            "Scalar subqueries are not yet supported in the physical plan".to_string(),
+        )),
         Expr::Between {
             expr,
             negated,
@@ -521,7 +564,7 @@ impl DefaultPhysicalPlanner {
                         })
                         .collect::<Result<Vec<_>>>()?;
 
-                    let initial_aggr = Arc::new(HashAggregateExec::try_new(
+                    let initial_aggr = Arc::new(AggregateExec::try_new(
                         AggregateMode::Partial,
                         groups.clone(),
                         aggregates.clone(),
@@ -563,7 +606,7 @@ impl DefaultPhysicalPlanner {
                         (initial_aggr, AggregateMode::Final)
                     };
 
-                    Ok(Arc::new(HashAggregateExec::try_new(
+                    Ok(Arc::new(AggregateExec::try_new(
                         next_partition_mode,
                         final_group
                             .iter()
@@ -780,6 +823,7 @@ impl DefaultPhysicalPlanner {
                     let right = self.create_initial_plan(right, session_state).await?;
                     Ok(Arc::new(CrossJoinExec::try_new(left, right)?))
                 }
+                LogicalPlan::Subquery(_) => todo!(),
                 LogicalPlan::EmptyRelation(EmptyRelation {
                     produce_one_row,
                     schema,
@@ -787,11 +831,9 @@ impl DefaultPhysicalPlanner {
                     *produce_one_row,
                     SchemaRef::new(schema.as_ref().to_owned().into()),
                 ))),
-                LogicalPlan::SubqueryAlias(SubqueryAlias { input, alias, .. }) => {
+                LogicalPlan::SubqueryAlias(SubqueryAlias { input,.. }) => {
                     match input.as_ref() {
-                        LogicalPlan::TableScan(scan) => {
-                            let mut scan = scan.clone();
-                            scan.table_name = alias.clone();
+                        LogicalPlan::TableScan(..) => {
                             self.create_initial_plan(input, session_state).await
                         }
                         _ => Err(DataFusionError::Plan("SubqueryAlias should only wrap TableScan".to_string()))
@@ -811,6 +853,11 @@ impl DefaultPhysicalPlanner {
                     };
 
                     Ok(Arc::new(GlobalLimitExec::new(input, limit)))
+                }
+                LogicalPlan::Offset(_) => {
+                    Err(DataFusionError::Internal(
+                        "Unsupported logical plan: OFFSET".to_string(),
+                    ))
                 }
                 LogicalPlan::CreateExternalTable(_) => {
                     // There is no default plan for "CREATE EXTERNAL
@@ -839,7 +886,7 @@ impl DefaultPhysicalPlanner {
                         "Unsupported logical plan: CreateCatalog".to_string(),
                     ))
                 }
-                | LogicalPlan::CreateMemoryTable(_) | LogicalPlan::DropTable (_) => {
+                | LogicalPlan::CreateMemoryTable(_) | LogicalPlan::DropTable (_) | LogicalPlan::CreateView(_) => {
                     // Create a dummy exec.
                     Ok(Arc::new(EmptyExec::new(
                         false,
@@ -954,7 +1001,27 @@ pub fn create_physical_expr(
                 input_schema,
                 execution_props,
             )?;
-            binary(lhs, *op, rhs, input_schema)
+            match (
+                lhs.data_type(input_schema)?,
+                op,
+                rhs.data_type(input_schema)?,
+            ) {
+                (
+                    DataType::Date32 | DataType::Date64,
+                    Operator::Plus | Operator::Minus,
+                    DataType::Interval(_),
+                ) => Ok(Arc::new(DateIntervalExpr::try_new(
+                    lhs,
+                    *op,
+                    rhs,
+                    input_schema,
+                )?)),
+                _ => {
+                    // assume that we can coerce both sides into a common type
+                    // and then perform a binary operation
+                    binary(lhs, *op, rhs, input_schema)
+                }
+            }
         }
         Expr::Case {
             expr,
@@ -1467,7 +1534,6 @@ fn tuple_err<T, R>(value: (Result<T>, Result<R>)) -> Result<(T, R)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::datafusion_data_access::object_store::local::LocalFileSystem;
     use crate::execution::context::TaskContext;
     use crate::execution::options::CsvReadOptions;
     use crate::execution::runtime_env::{RuntimeConfig, RuntimeEnv};
@@ -1475,13 +1541,13 @@ mod tests {
     use crate::physical_plan::{
         expressions, DisplayFormatType, Partitioning, Statistics,
     };
-    use crate::prelude::SessionConfig;
+    use crate::prelude::{SessionConfig, SessionContext};
     use crate::scalar::ScalarValue;
+    use crate::test_util::scan_empty;
     use crate::{
         logical_plan::LogicalPlanBuilder, physical_plan::SendableRecordBatchStream,
     };
     use arrow::datatypes::{DataType, Field, SchemaRef};
-    use async_trait::async_trait;
     use datafusion_common::{DFField, DFSchema, DFSchemaRef};
     use datafusion_expr::sum;
     use datafusion_expr::{col, lit};
@@ -1506,25 +1572,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_operators() -> Result<()> {
-        let testdata = crate::test_util::arrow_test_data();
-        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
-
-        let options = CsvReadOptions::new().schema_infer_max_records(100);
-        let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            path,
-            options,
-            None,
-            1,
-        )
-        .await?
-        // filter clause needs the type coercion rule applied
-        .filter(col("c7").lt(lit(5_u8)))?
-        .project(vec![col("c1"), col("c2")])?
-        .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
-        .sort(vec![col("c1").sort(true, true)])?
-        .limit(10)?
-        .build()?;
+        let logical_plan = test_csv_scan()
+            .await?
+            // filter clause needs the type coercion rule applied
+            .filter(col("c7").lt(lit(5_u8)))?
+            .project(vec![col("c1"), col("c2")])?
+            .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
+            .sort(vec![col("c1").sort(true, true)])?
+            .limit(10)?
+            .build()?;
 
         let plan = plan(&logical_plan).await?;
 
@@ -1558,20 +1614,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_with_csv_plan() -> Result<()> {
-        let testdata = crate::test_util::arrow_test_data();
-        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
-
-        let options = CsvReadOptions::new().schema_infer_max_records(100);
-        let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            path,
-            options,
-            None,
-            1,
-        )
-        .await?
-        .filter(col("c7").lt(col("c12")))?
-        .build()?;
+        let logical_plan = test_csv_scan()
+            .await?
+            .filter(col("c7").lt(col("c12")))?
+            .build()?;
 
         let plan = plan(&logical_plan).await?;
 
@@ -1584,10 +1630,6 @@ mod tests {
 
     #[tokio::test]
     async fn errors() -> Result<()> {
-        let testdata = crate::test_util::arrow_test_data();
-        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
-        let options = CsvReadOptions::new().schema_infer_max_records(100);
-
         let bool_expr = col("c1").eq(col("c1"));
         let cases = vec![
             // utf8 < u32
@@ -1606,15 +1648,7 @@ mod tests {
             col("c1").like(col("c2")),
         ];
         for case in cases {
-            let logical_plan = LogicalPlanBuilder::scan_csv(
-                Arc::new(LocalFileSystem {}),
-                &path,
-                options.clone(),
-                None,
-                1,
-            )
-            .await?
-            .project(vec![case.clone()]);
+            let logical_plan = test_csv_scan().await?.project(vec![case.clone()]);
             let message = format!(
                 "Expression {:?} expected to error due to impossible coercion",
                 case
@@ -1697,27 +1731,17 @@ mod tests {
 
     #[tokio::test]
     async fn in_list_types() -> Result<()> {
-        let testdata = crate::test_util::arrow_test_data();
-        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
-        let options = CsvReadOptions::new().schema_infer_max_records(100);
-
         // expression: "a in ('a', 1)"
         let list = vec![
             Expr::Literal(ScalarValue::Utf8(Some("a".to_string()))),
             Expr::Literal(ScalarValue::Int64(Some(1))),
         ];
-        let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
-            options.clone(),
-            None,
-            1,
-        )
-        .await?
-        // filter clause needs the type coercion rule applied
-        .filter(col("c12").lt(lit(0.05)))?
-        .project(vec![col("c1").in_list(list, false)])?
-        .build()?;
+        let logical_plan = test_csv_scan()
+            .await?
+            // filter clause needs the type coercion rule applied
+            .filter(col("c12").lt(lit(0.05)))?
+            .project(vec![col("c1").in_list(list, false)])?
+            .build()?;
         let execution_plan = plan(&logical_plan).await?;
         // verify that the plan correctly adds cast from Int64(1) to Utf8
         let expected = "InListExpr { expr: Column { name: \"c1\", index: 0 }, list: [Literal { value: Utf8(\"a\") }, CastExpr { expr: Literal { value: Int64(1) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }], negated: false, set: None }";
@@ -1728,18 +1752,12 @@ mod tests {
             Expr::Literal(ScalarValue::Boolean(Some(true))),
             Expr::Literal(ScalarValue::Utf8(Some("a".to_string()))),
         ];
-        let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
-            options.clone(),
-            None,
-            1,
-        )
-        .await?
-        // filter clause needs the type coercion rule applied
-        .filter(col("c12").lt(lit(0.05)))?
-        .project(vec![col("c12").lt_eq(lit(0.025)).in_list(list, false)])?
-        .build()?;
+        let logical_plan = test_csv_scan()
+            .await?
+            // filter clause needs the type coercion rule applied
+            .filter(col("c12").lt(lit(0.05)))?
+            .project(vec![col("c12").lt_eq(lit(0.025)).in_list(list, false)])?
+            .build()?;
         let execution_plan = plan(&logical_plan).await;
 
         let expected_error = "Unsupported CAST from Utf8 to Boolean";
@@ -1758,10 +1776,6 @@ mod tests {
 
     #[tokio::test]
     async fn in_set_test() -> Result<()> {
-        let testdata = crate::test_util::arrow_test_data();
-        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
-        let options = CsvReadOptions::new().schema_infer_max_records(100);
-
         // OPTIMIZER_INSET_THRESHOLD = 10
         // expression: "a in ('a', 1, 2, ..30)"
         let mut list = vec![Expr::Literal(ScalarValue::Utf8(Some("a".to_string())))];
@@ -1769,17 +1783,11 @@ mod tests {
             list.push(Expr::Literal(ScalarValue::Int64(Some(i))));
         }
 
-        let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
-            options,
-            None,
-            1,
-        )
-        .await?
-        .filter(col("c12").lt(lit(0.05)))?
-        .project(vec![col("c1").in_list(list, false)])?
-        .build()?;
+        let logical_plan = test_csv_scan()
+            .await?
+            .filter(col("c12").lt(lit(0.05)))?
+            .project(vec![col("c1").in_list(list, false)])?
+            .build()?;
         let execution_plan = plan(&logical_plan).await?;
         let expected = "expr: [(InListExpr { expr: Column { name: \"c1\", index: 0 }, list: [Literal { value: Utf8(\"a\") }, CastExpr { expr: Literal { value: Int64(1) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(2) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(3) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(4) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(5) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(6) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(7) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(8) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(9) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(10) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(11) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(12) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(13) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(14) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(15) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(16) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(17) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(18) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(19) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(20) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(21) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(22) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(23) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(24) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(25) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(26) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(27) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(28) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(29) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(30) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }], negated: false, set: Some(InSet { set:";
         assert!(format!("{:?}", execution_plan).contains(expected));
@@ -1788,26 +1796,17 @@ mod tests {
 
     #[tokio::test]
     async fn in_set_null_test() -> Result<()> {
-        let testdata = crate::test_util::arrow_test_data();
-        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
-        let options = CsvReadOptions::new().schema_infer_max_records(100);
         // test NULL
         let mut list = vec![Expr::Literal(ScalarValue::Int64(None))];
         for i in 1..31 {
             list.push(Expr::Literal(ScalarValue::Int64(Some(i))));
         }
 
-        let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
-            options,
-            None,
-            1,
-        )
-        .await?
-        .filter(col("c12").lt(lit(0.05)))?
-        .project(vec![col("c1").in_list(list, false)])?
-        .build()?;
+        let logical_plan = test_csv_scan()
+            .await?
+            .filter(col("c12").lt(lit(0.05)))?
+            .project(vec![col("c1").in_list(list, false)])?
+            .build()?;
         let execution_plan = plan(&logical_plan).await?;
         let expected = "expr: [(InListExpr { expr: Column { name: \"c1\", index: 0 }, list: [CastExpr { expr: Literal { value: Int64(NULL) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(1) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(2) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(3) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(4) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(5) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(6) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(7) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(8) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(9) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(10) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(11) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(12) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(13) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(14) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(15) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(16) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(17) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(18) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(19) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(20) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(21) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(22) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(23) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(24) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(25) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(26) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(27) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(28) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(29) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }, CastExpr { expr: Literal { value: Int64(30) }, cast_type: Utf8, cast_options: CastOptions { safe: false } }], negated: false, set: Some(InSet { set: ";
         assert!(format!("{:?}", execution_plan).contains(expected));
@@ -1816,26 +1815,15 @@ mod tests {
 
     #[tokio::test]
     async fn hash_agg_input_schema() -> Result<()> {
-        let testdata = crate::test_util::arrow_test_data();
-        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
-
-        let options = CsvReadOptions::new().schema_infer_max_records(100);
-        let logical_plan = LogicalPlanBuilder::scan_csv_with_name(
-            Arc::new(LocalFileSystem {}),
-            &path,
-            options,
-            None,
-            "aggregate_test_100",
-            1,
-        )
-        .await?
-        .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
-        .build()?;
+        let logical_plan = test_csv_scan_with_name("aggregate_test_100")
+            .await?
+            .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
+            .build()?;
 
         let execution_plan = plan(&logical_plan).await?;
         let final_hash_agg = execution_plan
             .as_any()
-            .downcast_ref::<HashAggregateExec>()
+            .downcast_ref::<AggregateExec>()
             .expect("hash aggregate");
         assert_eq!(
             "SUM(aggregate_test_100.c2)",
@@ -1850,26 +1838,16 @@ mod tests {
 
     #[tokio::test]
     async fn hash_agg_group_by_partitioned() -> Result<()> {
-        let testdata = crate::test_util::arrow_test_data();
-        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
-
-        let options = CsvReadOptions::new().schema_infer_max_records(100);
-        let logical_plan = LogicalPlanBuilder::scan_csv(
-            Arc::new(LocalFileSystem {}),
-            &path,
-            options,
-            None,
-            1,
-        )
-        .await?
-        .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
-        .build()?;
+        let logical_plan = test_csv_scan()
+            .await?
+            .aggregate(vec![col("c1")], vec![sum(col("c2"))])?
+            .build()?;
 
         let execution_plan = plan(&logical_plan).await?;
         let formatted = format!("{:?}", execution_plan);
 
         // Make sure the plan contains a FinalPartitioned, which means it will not use the Final
-        // mode in HashAggregate (which is slower)
+        // mode in Aggregate (which is slower)
         assert!(formatted.contains("FinalPartitioned"));
 
         Ok(())
@@ -1879,13 +1857,12 @@ mod tests {
     async fn test_explain() {
         let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
 
-        let logical_plan =
-            LogicalPlanBuilder::scan_empty(Some("employee"), &schema, None)
-                .unwrap()
-                .explain(true, false)
-                .unwrap()
-                .build()
-                .unwrap();
+        let logical_plan = scan_empty(Some("employee"), &schema, None)
+            .unwrap()
+            .explain(true, false)
+            .unwrap()
+            .build()
+            .unwrap();
 
         let plan = plan(&logical_plan).await.unwrap();
         if let Some(plan) = plan.as_any().downcast_ref::<ExplainExec>() {
@@ -1971,7 +1948,6 @@ mod tests {
         schema: SchemaRef,
     }
 
-    #[async_trait]
     impl ExecutionPlan for NoOpExecutionPlan {
         /// Return a reference to Any that can be used for downcasting
         fn as_any(&self) -> &dyn Any {
@@ -2005,7 +1981,7 @@ mod tests {
             unimplemented!("NoOpExecutionPlan::with_new_children");
         }
 
-        async fn execute(
+        fn execute(
             &self,
             _partition: usize,
             _context: Arc<TaskContext>,
@@ -2052,5 +2028,37 @@ mod tests {
                 )])),
             })))
         }
+    }
+
+    async fn test_csv_scan_with_name(name: &str) -> Result<LogicalPlanBuilder> {
+        let ctx = SessionContext::new();
+        let testdata = crate::test_util::arrow_test_data();
+        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let options = CsvReadOptions::new().schema_infer_max_records(100);
+        let logical_plan = match ctx.read_csv(path, options).await?.to_logical_plan()? {
+            LogicalPlan::TableScan(ref scan) => {
+                let mut scan = scan.clone();
+                scan.table_name = name.to_string();
+                let new_schema = scan
+                    .projected_schema
+                    .as_ref()
+                    .clone()
+                    .replace_qualifier(name);
+                scan.projected_schema = Arc::new(new_schema);
+                LogicalPlan::TableScan(scan)
+            }
+            _ => unimplemented!(),
+        };
+        Ok(LogicalPlanBuilder::from(logical_plan))
+    }
+
+    async fn test_csv_scan() -> Result<LogicalPlanBuilder> {
+        let ctx = SessionContext::new();
+        let testdata = crate::test_util::arrow_test_data();
+        let path = format!("{}/csv/aggregate_test_100.csv", testdata);
+        let options = CsvReadOptions::new().schema_infer_max_records(100);
+        Ok(LogicalPlanBuilder::from(
+            ctx.read_csv(path, options).await?.to_logical_plan()?,
+        ))
     }
 }

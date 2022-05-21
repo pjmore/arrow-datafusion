@@ -34,12 +34,11 @@ use crate::arrow::datatypes::SchemaRef;
 use crate::arrow::util::pretty;
 use crate::datasource::TableProvider;
 use crate::execution::context::{SessionState, TaskContext};
-use crate::logical_expr::TableType;
+use crate::logical_expr::{utils::find_window_exprs, TableType};
 use crate::physical_plan::file_format::{plan_to_csv, plan_to_json, plan_to_parquet};
 use crate::physical_plan::{collect, collect_partitioned};
 use crate::physical_plan::{execute_stream, execute_stream_partitioned, ExecutionPlan};
 use crate::scalar::ScalarValue;
-use crate::sql::utils::find_window_exprs;
 use parking_lot::RwLock;
 use std::any::Any;
 
@@ -86,8 +85,7 @@ impl DataFrame {
     /// Create a physical plan
     pub async fn create_physical_plan(&self) -> Result<Arc<dyn ExecutionPlan>> {
         let state = self.session_state.read().clone();
-        let optimized_plan = state.optimize(&self.plan)?;
-        state.create_physical_plan(&optimized_plan).await
+        state.create_physical_plan(&self.plan).await
     }
 
     /// Filter the DataFrame by column. Returns a new DataFrame only containing the
@@ -129,9 +127,9 @@ impl DataFrame {
     pub fn select(&self, expr_list: Vec<Expr>) -> Result<Arc<DataFrame>> {
         let window_func_exprs = find_window_exprs(&expr_list);
         let plan = if window_func_exprs.is_empty() {
-            self.to_logical_plan()
+            self.plan.clone()
         } else {
-            LogicalPlanBuilder::window_plan(self.to_logical_plan(), window_func_exprs)?
+            LogicalPlanBuilder::window_plan(self.plan.clone(), window_func_exprs)?
         };
         let project_plan = LogicalPlanBuilder::from(plan).project(expr_list)?.build()?;
 
@@ -155,7 +153,7 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn filter(&self, predicate: Expr) -> Result<Arc<DataFrame>> {
-        let plan = LogicalPlanBuilder::from(self.to_logical_plan())
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
             .filter(predicate)?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
@@ -184,7 +182,7 @@ impl DataFrame {
         group_expr: Vec<Expr>,
         aggr_expr: Vec<Expr>,
     ) -> Result<Arc<DataFrame>> {
-        let plan = LogicalPlanBuilder::from(self.to_logical_plan())
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
             .aggregate(group_expr, aggr_expr)?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
@@ -204,13 +202,14 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn limit(&self, n: usize) -> Result<Arc<DataFrame>> {
-        let plan = LogicalPlanBuilder::from(self.to_logical_plan())
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
             .limit(n)?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
     }
 
-    /// Calculate the union two [`DataFrame`]s.  The two [`DataFrame`]s must have exactly the same schema
+    /// Calculate the union of two [`DataFrame`]s, preserving duplicate rows.The
+    /// two [`DataFrame`]s must have exactly the same schema
     ///
     /// ```
     /// # use datafusion::prelude::*;
@@ -224,13 +223,14 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn union(&self, dataframe: Arc<DataFrame>) -> Result<Arc<DataFrame>> {
-        let plan = LogicalPlanBuilder::from(self.to_logical_plan())
-            .union(dataframe.to_logical_plan())?
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
+            .union(dataframe.plan.clone())?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
     }
 
-    /// Calculate the union distinct two [`DataFrame`]s.  The two [`DataFrame`]s must have exactly the same schema
+    /// Calculate the distinct union of two [`DataFrame`]s.  The
+    /// two [`DataFrame`]s must have exactly the same schema
     ///
     /// ```
     /// # use datafusion::prelude::*;
@@ -239,7 +239,28 @@ impl DataFrame {
     /// # async fn main() -> Result<()> {
     /// let ctx = SessionContext::new();
     /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
-    /// let df = df.union(df.clone())?;
+    /// let df = df.union_distinct(df.clone())?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn union_distinct(&self, dataframe: Arc<DataFrame>) -> Result<Arc<DataFrame>> {
+        Ok(Arc::new(DataFrame::new(
+            self.session_state.clone(),
+            &LogicalPlanBuilder::from(self.plan.clone())
+                .union_distinct(dataframe.plan.clone())?
+                .build()?,
+        )))
+    }
+
+    /// Filter out duplicate rows
+    ///
+    /// ```
+    /// # use datafusion::prelude::*;
+    /// # use datafusion::error::Result;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<()> {
+    /// let ctx = SessionContext::new();
+    /// let df = ctx.read_csv("tests/example.csv", CsvReadOptions::new()).await?;
     /// let df = df.distinct()?;
     /// # Ok(())
     /// # }
@@ -247,7 +268,7 @@ impl DataFrame {
     pub fn distinct(&self) -> Result<Arc<DataFrame>> {
         Ok(Arc::new(DataFrame::new(
             self.session_state.clone(),
-            &LogicalPlanBuilder::from(self.to_logical_plan())
+            &LogicalPlanBuilder::from(self.plan.clone())
                 .distinct()?
                 .build()?,
         )))
@@ -268,7 +289,7 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn sort(&self, expr: Vec<Expr>) -> Result<Arc<DataFrame>> {
-        let plan = LogicalPlanBuilder::from(self.to_logical_plan())
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
             .sort(expr)?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
@@ -300,9 +321,9 @@ impl DataFrame {
         left_cols: &[&str],
         right_cols: &[&str],
     ) -> Result<Arc<DataFrame>> {
-        let plan = LogicalPlanBuilder::from(self.to_logical_plan())
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
             .join(
-                &right.to_logical_plan(),
+                &right.plan.clone(),
                 join_type,
                 (left_cols.to_vec(), right_cols.to_vec()),
             )?
@@ -329,7 +350,7 @@ impl DataFrame {
         &self,
         partitioning_scheme: Partitioning,
     ) -> Result<Arc<DataFrame>> {
-        let plan = LogicalPlanBuilder::from(self.to_logical_plan())
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
             .repartition(partitioning_scheme)?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
@@ -470,8 +491,10 @@ impl DataFrame {
     }
 
     /// Return the logical plan represented by this DataFrame.
-    pub fn to_logical_plan(&self) -> LogicalPlan {
-        self.plan.clone()
+    pub fn to_logical_plan(&self) -> Result<LogicalPlan> {
+        // Optimize the plan first for better UX
+        let state = self.session_state.read().clone();
+        state.optimize(&self.plan)
     }
 
     /// Return a DataFrame with the explanation of its plan so far.
@@ -490,7 +513,7 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn explain(&self, verbose: bool, analyze: bool) -> Result<Arc<DataFrame>> {
-        let plan = LogicalPlanBuilder::from(self.to_logical_plan())
+        let plan = LogicalPlanBuilder::from(self.plan.clone())
             .explain(verbose, analyze)?
             .build()?;
         Ok(Arc::new(DataFrame::new(self.session_state.clone(), &plan)))
@@ -529,8 +552,8 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn intersect(&self, dataframe: Arc<DataFrame>) -> Result<Arc<DataFrame>> {
-        let left_plan = self.to_logical_plan();
-        let right_plan = dataframe.to_logical_plan();
+        let left_plan = self.plan.clone();
+        let right_plan = dataframe.plan.clone();
         Ok(Arc::new(DataFrame::new(
             self.session_state.clone(),
             &LogicalPlanBuilder::intersect(left_plan, right_plan, true)?,
@@ -551,8 +574,8 @@ impl DataFrame {
     /// # }
     /// ```
     pub fn except(&self, dataframe: Arc<DataFrame>) -> Result<Arc<DataFrame>> {
-        let left_plan = self.to_logical_plan();
-        let right_plan = dataframe.to_logical_plan();
+        let left_plan = self.plan.clone();
+        let right_plan = dataframe.plan.clone();
 
         Ok(Arc::new(DataFrame::new(
             self.session_state.clone(),
@@ -635,7 +658,8 @@ impl TableProvider for DataFrame {
             self.session_state.clone(),
             &limit
                 .map_or_else(|| Ok(expr.clone()), |n| expr.limit(n))?
-                .to_logical_plan(),
+                .plan
+                .clone(),
         )
         .create_physical_plan()
         .await
@@ -663,7 +687,7 @@ mod tests {
 
         let t = test_table().await?;
         let t2 = t.select_columns(&["c1", "c2", "c11"])?;
-        let plan = t2.to_logical_plan();
+        let plan = t2.plan.clone();
 
         // build query using SQL
         let sql_plan = create_plan("SELECT c1, c2, c11 FROM aggregate_test_100").await?;
@@ -679,7 +703,7 @@ mod tests {
         // build plan using Table API
         let t = test_table().await?;
         let t2 = t.select(vec![col("c1"), col("c2"), col("c11")])?;
-        let plan = t2.to_logical_plan();
+        let plan = t2.plan.clone();
 
         // build query using SQL
         let sql_plan = create_plan("SELECT c1, c2, c11 FROM aggregate_test_100").await?;
@@ -702,7 +726,7 @@ mod tests {
             window_frame: None,
         };
         let t2 = t.select(vec![col("c1"), first_row])?;
-        let plan = t2.to_logical_plan();
+        let plan = t2.plan.clone();
 
         let sql_plan = create_plan(
             "select c1, first_value(c1) over (partition by c2) from aggregate_test_100",
@@ -768,7 +792,7 @@ mod tests {
         // build query using Table API
         let t = test_table().await?;
         let t2 = t.select_columns(&["c1", "c2", "c11"])?.limit(10)?;
-        let plan = t2.to_logical_plan();
+        let plan = t2.plan.clone();
 
         // build query using SQL
         let sql_plan =
@@ -788,7 +812,7 @@ mod tests {
             .select_columns(&["c1", "c2", "c11"])?
             .limit(10)?
             .explain(false, false)?;
-        let plan = df.to_logical_plan();
+        let plan = df.plan.clone();
 
         // build query using SQL
         let sql_plan =
@@ -825,7 +849,7 @@ mod tests {
         let f = df.registry();
 
         let df = df.select(vec![f.udf("my_fn")?.call(vec![col("c12")])])?;
-        let plan = df.to_logical_plan();
+        let plan = df.plan.clone();
 
         // build query using SQL
         let sql_plan =
@@ -852,7 +876,7 @@ mod tests {
     async fn intersect() -> Result<()> {
         let df = test_table().await?.select_columns(&["c1", "c3"])?;
         let plan = df.intersect(df.clone())?;
-        let result = plan.to_logical_plan();
+        let result = plan.plan.clone();
         let expected = create_plan(
             "SELECT c1, c3 FROM aggregate_test_100
             INTERSECT ALL SELECT c1, c3 FROM aggregate_test_100",
@@ -866,7 +890,7 @@ mod tests {
     async fn except() -> Result<()> {
         let df = test_table().await?.select_columns(&["c1", "c3"])?;
         let plan = df.except(df.clone())?;
-        let result = plan.to_logical_plan();
+        let result = plan.plan.clone();
         let expected = create_plan(
             "SELECT c1, c3 FROM aggregate_test_100
             EXCEPT ALL SELECT c1, c3 FROM aggregate_test_100",
@@ -880,7 +904,7 @@ mod tests {
     async fn register_table() -> Result<()> {
         let df = test_table().await?.select_columns(&["c1", "c12"])?;
         let ctx = SessionContext::new();
-        let df_impl = Arc::new(DataFrame::new(ctx.state.clone(), &df.to_logical_plan()));
+        let df_impl = Arc::new(DataFrame::new(ctx.state.clone(), &df.plan.clone()));
 
         // register a dataframe as a table
         ctx.register_table("test_table", df_impl.clone())?;

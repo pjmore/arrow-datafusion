@@ -356,6 +356,7 @@ impl From<&AggregateFunction> for protobuf::AggregateFunction {
                 Self::ApproxPercentileContWithWeight
             }
             AggregateFunction::ApproxMedian => Self::ApproxMedian,
+            AggregateFunction::Grouping => Self::Grouping,
         }
     }
 }
@@ -541,6 +542,7 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
                     AggregateFunction::ApproxMedian => {
                         protobuf::AggregateFunction::ApproxMedian
                     }
+                    AggregateFunction::Grouping => protobuf::AggregateFunction::Grouping,
                 };
 
                 let aggregate_expr = protobuf::AggregateExprNode {
@@ -711,7 +713,15 @@ impl TryFrom<&Expr> for protobuf::LogicalExprNode {
             Expr::Wildcard => Self {
                 expr_type: Some(ExprType::Wildcard(true)),
             },
-            _ => unimplemented!(),
+            Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+                // we would need to add logical plan operators to datafusion.proto to support this
+                // see discussion in https://github.com/apache/arrow-datafusion/issues/2565
+                unimplemented!("subquery expressions are not supported yet")
+            }
+            Expr::QualifiedWildcard { .. }
+            | Expr::GetIndexedField { .. }
+            | Expr::TryCast { .. }
+            | Expr::GroupingSet(_) => unimplemented!(),
         };
 
         Ok(expr_node)
@@ -1069,6 +1079,8 @@ impl TryFrom<&BuiltinScalarFunction> for protobuf::ScalarFunction {
             BuiltinScalarFunction::Translate => Self::Translate,
             BuiltinScalarFunction::RegexpMatch => Self::RegexpMatch,
             BuiltinScalarFunction::Coalesce => Self::Coalesce,
+            BuiltinScalarFunction::Power => Self::Power,
+            BuiltinScalarFunction::Struct => Self::StructFun,
         };
 
         Ok(scalar_function)
