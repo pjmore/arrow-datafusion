@@ -24,7 +24,7 @@ use arrow::{
     array::{
         ArrayData, ArrayRef, BooleanArray, LargeStringArray, PrimitiveArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
-        UInt32BufferBuilder, UInt32Builder, UInt64BufferBuilder, UInt64Builder, BufferBuilder, Date32Array, Date64Array,
+        UInt32BufferBuilder, UInt32Builder, UInt64BufferBuilder, UInt64Builder, BufferBuilder, Date32Array, Date64Array, DecimalArray,
     },
     compute,
     datatypes::{UInt32Type, UInt64Type},
@@ -648,22 +648,16 @@ const HASH_BUFFER_SIZE: usize = 128;
 
 impl<const N: usize> HashJoinBuffers<N>{
     #[inline]
-    unsafe fn get_matching_data_unchecked(&self, idx: usize)->(bool, u64, u32){
-        let is_match = *self.match_buffer.get_unchecked(idx);
-        let lidx = *self.left_index_buffer.get_unchecked(idx);
-        let ridx = *self.right_index_buffer.get_unchecked(idx);
-        (is_match, lidx, ridx)
-    }
-
-    #[inline]
+    //Sets the mapping data, sets up the equality check for the row at lidx in the left record batch and the row in ridx in the right record batch.
+    //SAFETY: Caller must ensure that idx < N
     unsafe fn set_mapping_data(&mut self, idx: u32, lidx: u64, ridx: u32){
         *self.left_index_buffer.get_unchecked_mut(idx as usize ) = lidx;
         *self.right_index_buffer.get_unchecked_mut(idx as usize ) = ridx;
     }
 
     #[inline]
-    /// Process the match and mapping buffers as if a inner join is being doing, appending those mappings where all rows are equal to the indices buffer builders.
-    /// SAFETY: All values withing the current instances left_index_buffer and right_index_buffer must be within bounds for the left and right array respectively.
+    /// Process the match and mapping buffers as if a inner or left join is being done, appending those mappings where all rows are equal to the indices buffer builders.
+    /// SAFETY: All values within the current instance's left_index_buffer and right_index_buffer must be within bounds for the left and right array respectively.
     unsafe fn process_buffers_inner_or_left<const PROCESS_ALL: bool>(&mut self, left_arrays: &[ArrayRef], right_arrays: &[ArrayRef], left_indices: &mut UInt64BufferBuilder, right_indices:&mut UInt32BufferBuilder, num_to_process: u32, null_equals_null: bool)->ArrowResult<()>{
             let matches = &mut self.match_buffer;
             let left_indexes = &self.left_index_buffer;
@@ -683,8 +677,8 @@ impl<const N: usize> HashJoinBuffers<N>{
             Ok(())
     }
     #[inline]
-    /// Process the match and mapping buffers as if a right join is being doing, appending those mappings where all rows are equal to the indices buffer builders.
-    /// SAFETY: All values withing the current instances left_index_buffer and right_index_buffer must be within bounds for the left and right array respectively.
+    /// Processes the match and mapping buffers as if a right or full outer join is being done, appending those mappings where all rows are equal to the indices buffer builders.
+    /// SAFETY: All values within the current instance's left_index_buffer and right_index_buffer must be within bounds for the left and right array respectively.
     unsafe fn process_buffers_full_or_right<const PROCESS_ALL: bool>(&mut self, left_arrays: &[ArrayRef], right_arrays: &[ArrayRef], left_indices: &mut UInt64Builder, right_indices:&mut UInt32Builder, num_to_process: u32, null_equals_null: bool, curr_ridx: &mut u32, matched: &mut bool)->Result<()>{
         let matches = &mut self.match_buffer;
         let left_indexes = &self.left_index_buffer;
@@ -694,12 +688,13 @@ impl<const N: usize> HashJoinBuffers<N>{
         }else{
             num_to_process
         };
-        //println!("Processing right buffers: ISFull[{}] {}",PROCESS_ALL, num_to_process);
         check_equal_rows_vectorized(matches, &left_arrays, &right_arrays, left_indexes, right_indexes, num_to_process, null_equals_null)?;
         self.build_mappings_full_or_right(left_indices,  right_indices, num_to_process, curr_ridx, matched)?;
         Ok(())
     }
     #[inline]
+    /// Processes the match and mapping buffers as if a semi or anti join is being done, appending those mappings where all rows are equal to the indices buffer builders.
+    /// SAFETY: All values within the current instance's left_index_buffer and right_index_buffer must be within bounds for the left and right array respectively.
     unsafe fn process_buffers_semi_or_anti<const PROCESS_ALL: bool>(&mut self, left_arrays: &[ArrayRef], right_arrays: &[ArrayRef], left_indices: &mut UInt64BufferBuilder, num_to_process: u32, null_equals_null:bool)->Result<()>{
         let matches = &mut self.match_buffer;
         let left_indexes = &self.left_index_buffer;
@@ -727,21 +722,30 @@ impl<const N: usize> HashJoinBuffers<N>{
 
 
 impl<const N:usize> HashJoinBuffers<N>{
-    fn build_mappings_full_or_right(&self,left_indices: &mut UInt64Builder, right_indices: &mut UInt32Builder, num_to_process: u32, curr_ridx: &mut u32, matched: &mut bool)->ArrowResult<()>{
+    fn match_iter(&self, num_to_process: u32)->impl Iterator<Item=(bool, u64, u32)> + '_{
         assert!(num_to_process <= N as u32);
-        for i in 0..num_to_process{
-            let (is_match, lidx, ridx) = unsafe{self.get_matching_data_unchecked(i as usize)};
+        self.match_buffer.iter().copied().take(num_to_process as usize).zip(
+            self.left_index_buffer.iter().copied().zip(
+                self.right_index_buffer.iter().copied()
+        )).map(| (is_match, (lidx, ridx))| (is_match, lidx, ridx))
+    }
+
+    fn left_index_match_iter(&self, num_to_process: u32)->impl Iterator<Item=(bool, u64)> + '_{
+        assert!(num_to_process <= N as u32);
+        self.match_buffer.iter().copied().take(num_to_process as usize).zip(self.left_index_buffer.iter().copied())
+    }
+
+    fn build_mappings_full_or_right(&self,left_indices: &mut UInt64Builder, right_indices: &mut UInt32Builder, num_to_process: u32, curr_ridx: &mut u32, matched: &mut bool)->ArrowResult<()>{
+        for (is_match, lidx, ridx) in self.match_iter(num_to_process){
             if *curr_ridx != ridx{
                 if !*matched{
-                    //println!("Adding null<->{}",ridx);
                     left_indices.append_null()?;
-                    right_indices.append_value(ridx)?;
+                    right_indices.append_value(*curr_ridx)?;
                 }
                 *curr_ridx = ridx;
                 *matched = false;
             }
             if is_match{
-                //println!("Adding {lidx}<->{ridx}");
                 left_indices.append_value(lidx)?;
                 right_indices.append_value(ridx)?;
                 *matched = true;
@@ -751,9 +755,7 @@ impl<const N:usize> HashJoinBuffers<N>{
     }
     
     fn build_mappings_inner_or_left(&self, left_indices: &mut BufferBuilder<u64>, right_indices: &mut BufferBuilder<u32>, num_to_process: u32){
-        assert!(num_to_process as usize <= N);
-        for i in 0..num_to_process{
-            let (is_match, lidx, ridx) = unsafe{self.get_matching_data_unchecked(i as usize)};
+        for (is_match, lidx, ridx) in self.match_iter(num_to_process){
             if is_match{
                 left_indices.append(lidx);
                 right_indices.append(ridx as u32);
@@ -762,10 +764,7 @@ impl<const N:usize> HashJoinBuffers<N>{
     }
 
     fn build_mappings_semi_or_anti(&self, left_indices: &mut BufferBuilder<u64>, num_to_process: u32){
-        assert!(num_to_process as usize <= N);
-        for i in 0..num_to_process{
-            let is_match = *unsafe{self.match_buffer.get_unchecked(i as usize)};
-            let lidx = *unsafe{self.left_index_buffer.get_unchecked(i as usize)};
+        for (is_match, lidx) in self.left_index_match_iter(num_to_process) {
             if is_match{
                 left_indices.append(lidx);
             }
@@ -791,26 +790,30 @@ fn build_join_indexes_full_or_right<const N: usize>(
     assert!(N <= u32::MAX as usize);
     let mut left_indices = UInt64Array::builder(0);
     let mut right_indices = UInt32Array::builder(0);
-    let mut right_idx: u32 = 0;
+
     let mut buffer_idx:u32 = 0;
     let right_row_count:u32 = keys_values[0].len().try_into().expect("Number of rows for record batch should be less than u32::MAX, which is 4294967295, rows");
     
     let mut curr_ridx = u32::MAX;
     let mut matched = true;
-    while right_idx < right_row_count{
-        let num_to_process = (right_row_count - right_idx).min(N as u32);
-        //Fill the buffer with num_to_process hashes
-        create_hashes_chunked(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache,right_idx, num_to_process)?;
-        //For each hash get matching row mappings. When buffer is full then 
-        for hash_idx in 0..num_to_process{
-            let row = right_idx + hash_idx;
+    
+
+    let remainder_count = right_row_count % (N as u32);
+    let exact_chunk_len = right_row_count - remainder_count;
+
+    for offset in (0..exact_chunk_len).step_by(N){
+        create_hashes_chunked::<N, true>(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache,offset, N as u32)?;
+        for hash_idx in 0..(N as u32){
+            let row = offset + hash_idx;
             let hash_value = buffers.hash_buffer[hash_idx as usize];
-            if let Some((_, indices)) = left_hashmap.0.get(hash_value, |(hash, _)| hash_value == *hash){
+            if let Some((_, indices))=left_hashmap.0.get(hash_value, |(hash, _)| hash_value == *hash){
                 for i in indices{
+                    //SAFETY: Since the value of the buffer_idx is checked every loop and reset if it is equal to N, buffer_idx < N.
                     unsafe{buffers.set_mapping_data(buffer_idx, *i, row)};
                     buffer_idx +=1;
                     if buffer_idx == (N as u32){
-                        
+                        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+                        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
                         unsafe{
                             buffers.process_buffers_full_or_right::<true>(left_join_values, keys_values, &mut left_indices, &mut right_indices, N as u32, null_equals_null, &mut curr_ridx, &mut matched)?;
                         }
@@ -822,17 +825,42 @@ fn build_join_indexes_full_or_right<const N: usize>(
                 right_indices.append_value(row as u32)?;
             }
         }
-        right_idx += num_to_process;
+    }
+    //If there are remaining rows to process handle them
+    if remainder_count != 0{
+        create_hashes_chunked::<N, false>(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache,exact_chunk_len, remainder_count)?;
+        for hash_idx in 0..remainder_count{
+            let row = exact_chunk_len + hash_idx;
+            let hash_value =  buffers.hash_buffer[hash_idx as usize];
+            if let Some((_, indices))=left_hashmap.0.get(hash_value, |(hash, _)| hash_value == *hash){
+                for i in indices{
+                    //SAFETY: Since the value of the buffer_idx is checked every loop and reset if it is equal to N, buffer_idx < N.
+                    unsafe{buffers.set_mapping_data(buffer_idx, *i, row)};
+                    buffer_idx +=1;
+                    if buffer_idx == (N as u32){
+                        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+                        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
+                        unsafe{
+                            buffers.process_buffers_full_or_right::<true>(left_join_values, keys_values, &mut left_indices, &mut right_indices, N as u32, null_equals_null, &mut curr_ridx, &mut matched)?;
+                        }
+                        buffer_idx = 0;
+                    }
+                }
+            }else{
+                left_indices.append_null()?;
+                right_indices.append_value(row as u32)?;
+            }
+        }
     }
     if buffer_idx != 0{
+        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
         unsafe{
             buffers.process_buffers_full_or_right::<false>(left_join_values, keys_values, &mut left_indices, &mut right_indices, buffer_idx, null_equals_null, &mut curr_ridx, &mut matched)?;
         }
-    }
-    
+    }    
     
     if !matched{
-        //println!("Adding null<->{curr_ridx}");
         left_indices.append_null()?;
         right_indices.append_value(curr_ridx)?;
     }
@@ -851,24 +879,27 @@ fn build_join_indexes_inner_or_left<const N: usize>(
     // Using a buffer builder to avoid slower normal builder
     let mut left_indices = UInt64BufferBuilder::new(0);
     let mut right_indices = UInt32BufferBuilder::new(0);
-    let mut right_idx = 0;
     let mut buffer_idx:u32 = 0;
     let right_row_count:u32 = keys_values[0].len().try_into().expect("Number of rows for record batch should be less than u32::MAX, which is 4294967295, rows");
 
-    
-    while right_idx < right_row_count{
-        let num_to_process = (right_row_count - right_idx).min(N as u32);
-        //Fill the buffer with num_to_process hashes
-        create_hashes_chunked(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache, right_idx, num_to_process)?;
-        //For each hash get matching row mappings. When buffer is full then 
-        for hash_idx in 0..num_to_process{
-            let row = right_idx + hash_idx;
+    let remainder_count = right_row_count % (N as u32);
+    let exact_chunk_len = right_row_count - remainder_count;
+
+
+    for offset in (0..exact_chunk_len).step_by(N){
+        create_hashes_chunked::<N,true>(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache, offset, N as u32)?;
+        for hash_idx in 0..(N as u32){
+            let row = offset + hash_idx;
             let hash_value = buffers.hash_buffer[hash_idx as usize];
             if let Some((_, indices)) = left_hashmap.0.get(hash_value, |(hash, _)| hash_value == *hash){
                 for i in indices{
+                    //SAFETY: Since the value of the buffer_idx is checked every loop and reset if it is equal to N, buffer_idx < N.
                     unsafe{buffers.set_mapping_data(buffer_idx, *i, row)};
                     buffer_idx +=1;
                     if buffer_idx == (N as u32){
+                        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+                        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
+
                         unsafe{buffers.process_buffers_inner_or_left::<true>(left_join_values, keys_values, &mut left_indices, &mut right_indices, N as u32, null_equals_null)?;
                         }
                         buffer_idx = 0;
@@ -876,10 +907,35 @@ fn build_join_indexes_inner_or_left<const N: usize>(
                 }
             }
         }
-        right_idx += num_to_process;
+    }
+    if remainder_count != 0{
+        create_hashes_chunked::<N,false>(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache, exact_chunk_len, remainder_count)?;
+        for hash_idx in 0..remainder_count{
+            let row = exact_chunk_len + hash_idx;
+            let hash_value = buffers.hash_buffer[hash_idx as usize];
+            if let Some((_, indices)) = left_hashmap.0.get(hash_value, |(hash, _)| hash_value == *hash){
+                for i in indices{
+                    //SAFETY: Since the value of the buffer_idx is checked every loop and reset if it is equal to N, buffer_idx < N.
+                    unsafe{buffers.set_mapping_data(buffer_idx, *i, row)};
+                    buffer_idx +=1;
+                    if buffer_idx == (N as u32){
+                        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+                        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
+
+                        unsafe{buffers.process_buffers_inner_or_left::<true>(left_join_values, keys_values, &mut left_indices, &mut right_indices, N as u32, null_equals_null)?;
+                        }
+                        buffer_idx = 0;
+                    }
+                }
+            }
+        }
     }
     if buffer_idx != 0{
-        unsafe{buffers.process_buffers_inner_or_left::<false>(left_join_values, keys_values, &mut left_indices, &mut right_indices, buffer_idx, null_equals_null)?;
+        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
+
+        unsafe{
+            buffers.process_buffers_inner_or_left::<false>(left_join_values, keys_values, &mut left_indices, &mut right_indices, buffer_idx, null_equals_null)?;
         }
     }
 
@@ -912,35 +968,63 @@ fn build_join_indexes_semi_or_anti<const N: usize>(
 
     // Using a buffer builder to avoid slower normal builder
     let mut left_indices = UInt64BufferBuilder::new(0);
-    let mut right_idx: u32 = 0;
-    let mut idx_buffer_idx: u32 = 0;
-    let right_row_count = keys_values[0].len().try_into().expect("Number of rows for record batch should be less than u32::MAX, which is 4294967295, rows");
-    while right_idx < right_row_count{
-        let num_to_process = (right_row_count - right_idx).min(N as u32);
-        //Fill the buffer with num_to_process hashes
-        create_hashes_chunked(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache, right_idx, num_to_process)?;
+    let mut buffer_idx: u32 = 0;
+    let right_row_count: u32 = keys_values[0].len().try_into().expect("Number of rows for record batch should be less than u32::MAX, which is 4294967295, rows");
 
-        
-        //For each hash get matching row mappings. When buffer is full then 
-        for hash_idx in 0..num_to_process{
-            let row = right_idx + hash_idx;
+    let remainder_count = right_row_count % (N as u32);
+    let exact_chunk_len = right_row_count - remainder_count;
+
+    for offset in (0..exact_chunk_len).step_by(N){
+        create_hashes_chunked::<N, true>(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache, offset, N as u32)?;
+        for hash_idx in 0..(N as u32){
+            let row = offset + hash_idx;
             let hash_value = buffers.hash_buffer[hash_idx as usize];
             if let Some((_, indices)) = left_hashmap.0.get(hash_value, |(hash, _)| hash_value == *hash){
                 for i in indices{
-                    unsafe{buffers.set_mapping_data(idx_buffer_idx, *i,row)};
-                    idx_buffer_idx +=1;
-                    if idx_buffer_idx == (N as u32){
+                    //SAFETY: Since the value of the buffer_idx is checked every loop and reset if it is equal to N, buffer_idx < N.
+
+                    unsafe{buffers.set_mapping_data(buffer_idx, *i,row)};
+                    buffer_idx +=1;
+                    if buffer_idx == (N as u32){
+                        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+                        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
+
                         unsafe{buffers.process_buffers_semi_or_anti::<true>(left_join_values, keys_values, &mut left_indices, N as u32, null_equals_null)?;
                         }
-                        idx_buffer_idx = 0;
+                        buffer_idx = 0;
                     }
                 }
             }
         }
-        right_idx += num_to_process;
     }
-    if idx_buffer_idx != 0{
-        unsafe{ buffers.process_buffers_semi_or_anti::<false>(left_join_values, keys_values, &mut left_indices, idx_buffer_idx, null_equals_null)?;
+    if remainder_count != 0{
+        create_hashes_chunked::<N,false>(&keys_values, random_state, &mut buffers.hash_buffer, &mut buffers.dictionary_hash_cache, exact_chunk_len, remainder_count)?;
+        for hash_idx in 0..remainder_count{
+            let row = exact_chunk_len + hash_idx;
+            let hash_value = buffers.hash_buffer[hash_idx as usize];
+            if let Some((_, indices)) = left_hashmap.0.get(hash_value, |(hash, _)| hash_value == *hash){
+                for i in indices{
+                    //SAFETY: Since the value of the buffer_idx is checked every loop and reset if it is equal to N, buffer_idx < N.
+                    unsafe{buffers.set_mapping_data(buffer_idx, *i,row)};
+                    buffer_idx +=1;
+                    if buffer_idx == (N as u32){
+                        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+                        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
+
+                        unsafe{buffers.process_buffers_semi_or_anti::<true>(left_join_values, keys_values, &mut left_indices, N as u32, null_equals_null)?;
+                        }
+                        buffer_idx = 0;
+                    }
+                }
+            }
+        }
+    }
+    if buffer_idx != 0{
+        //SAFETY: The values that are in buffers.left_index_buffer come from the hashmap which is filled with values that are less than left_array.len()
+        //From the loop condition above right_idx < right_arrays.len() and num_to_process is calculated based off of 
+
+        unsafe{ 
+            buffers.process_buffers_semi_or_anti::<false>(left_join_values, keys_values, &mut left_indices, buffer_idx, null_equals_null)?;
         }
     }
 
@@ -961,6 +1045,7 @@ fn build_join_indexes_semi_or_anti<const N: usize>(
 macro_rules! declare_equal_rows_check{
     (DECLARE_CUSTOM_GET_VAL: $fn_name:ident,$array_type:ty, $get_value:ident, $internal_buffer_size:literal)=>{
         #[allow(unused_unsafe)]
+        /// SAFETY: left_indexes must only contain indexes which are in bounds for l. right_indexes must only contain indexes which are within bounds for r. 
         unsafe fn $fn_name<const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r:  &dyn Array, null_equals_null: bool, num_to_process: u32)->u32{
             //use prefetch::prefetch::{Read, prefetch, Data, Low as Locality};
             const INTERNAL_BUFFER_SIZE: usize = $internal_buffer_size;
@@ -1073,8 +1158,10 @@ declare_equal_rows_check!(DECLARE: check_equal_rows_time_ns, TimestampNanosecond
 declare_equal_rows_check!(DECLARE: check_equal_rows_utf8, StringArray, 64);
 declare_equal_rows_check!(DECLARE: check_equal_rows_largeutf8, LargeStringArray, 64);
 declare_equal_rows_check!(DECLARE: check_equal_rows_bool, BooleanArray, 64);
+declare_equal_rows_check!(DECLARE_CUSTOM_GET_VAL: check_equal_rows_decimal, DecimalArray, value, 64);
 
-
+//SAFETY: left_indexes must only contain indexes which are within bounds for l.
+//right_indexes must only contain indexes which are within bounds for r.
 unsafe fn check_rows_equal_vectorized<const N: usize, const FIRST_COL: bool>(matches: &mut [bool; N],
     l: &dyn Array,
     r:  &dyn Array,
@@ -1109,6 +1196,7 @@ unsafe fn check_rows_equal_vectorized<const N: usize, const FIRST_COL: bool>(mat
         DataType::Date64 => check_equal_rows_date64::<N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
         DataType::Utf8 => check_equal_rows_utf8::<N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
         DataType::LargeUtf8 => check_equal_rows_largeutf8::<N, FIRST_COL>(matches, left_indexes, right_indexes, l,r,null_equals_null, num_to_process),
+        DataType::Decimal(_,_)=>check_equal_rows_decimal::<N, FIRST_COL>(matches, left_indexes, right_indexes, l,r, null_equals_null, num_to_process),
         dt => {
             // This is internal because we should have caught this before.
             return Err(DataFusionError::Internal(
@@ -1119,7 +1207,8 @@ unsafe fn check_rows_equal_vectorized<const N: usize, const FIRST_COL: bool>(mat
     Ok(match_count)
 }
 
-
+//SAFETY: left_indexes must only contain indexes which are within bounds for l.
+//right_indexes must only contain indexes which are within bounds for r.
 unsafe fn check_equal_rows_vectorized<const N: usize>(
     matches: &mut [bool; N],
     left_arrays: &[ArrayRef],
@@ -1244,7 +1333,7 @@ impl JoinData{
     }
 }
 
-fn build_batch_new<const N: usize>(right: &RecordBatch,left_data:&(JoinHashMap, RecordBatch), join_data: &mut JoinData, buffers: &mut HashJoinBuffers<N>)->ArrowResult<(RecordBatch, UInt64Array)>{
+fn build_batch<const N: usize>(right: &RecordBatch,left_data:&(JoinHashMap, RecordBatch), join_data: &mut JoinData, buffers: &mut HashJoinBuffers<N>)->ArrowResult<(RecordBatch, UInt64Array)>{
     let keys_values = join_data.keys_values(right)?;
     let left_join_values = if join_data.left_join_values.is_none(){
         join_data.left_join_values = Some(JoinData::left_join_values(&join_data.on_left, left_data)?);
@@ -1264,19 +1353,10 @@ fn build_batch_new<const N: usize>(right: &RecordBatch,left_data:&(JoinHashMap, 
             return Ok((RecordBatch::new_empty(join_data.schema.clone()), left_indices));
         } 
     };
-    //println!("Left: \n{}", arrow::util::pretty::pretty_format_batches(&[join_data.left_data.1.clone()]).unwrap());
-    //println!("Right: \n{}", arrow::util::pretty::pretty_format_batches(&[right.clone()]).unwrap());
     build_batch_from_indices(join_data, left_data, right, left_indices, right_indices)
 }
 
 
-impl HashJoinStream{
-    fn build_batch(&mut self, right: &RecordBatch, left_data: &(JoinHashMap, RecordBatch))->ArrowResult<(RecordBatch, UInt64Array)>{
-        let join_data = &mut self.join_data;
-        let buffers = &mut self.join_buffers;
-        build_batch_new(right, left_data, join_data, buffers)
-    }
-}
 
 
 impl HashJoinStream {
@@ -1313,7 +1393,7 @@ impl HashJoinStream {
                 let join_data = &mut self.join_data;
                 let buffers = &mut self.join_buffers;
                 
-                let result = build_batch_new(&batch, left_data, join_data, buffers);
+                let result = build_batch(&batch, left_data, join_data, buffers);
                 
                 self.join_metrics.input_batches.add(1);
                 self.join_metrics.input_rows.add(batch.num_rows());

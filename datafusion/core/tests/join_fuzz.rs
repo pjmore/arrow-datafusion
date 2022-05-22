@@ -77,8 +77,8 @@ async fn test_full_join_1k() {
 #[tokio::test]
 async fn test_semi_join_1k() {
     run_join_test(
-        make_staggered_batches(10000),
-        make_staggered_batches(10000),
+        make_staggered_batches(1000),
+        make_staggered_batches(1000),
         JoinType::Semi,
     )
     .await
@@ -87,8 +87,8 @@ async fn test_semi_join_1k() {
 #[tokio::test]
 async fn test_anti_join_1k() {
     run_join_test(
-        make_staggered_batches(10000),
-        make_staggered_batches(10000),
+        make_staggered_batches(1000),
+        make_staggered_batches(1000),
         JoinType::Anti,
     )
     .await
@@ -163,7 +163,6 @@ async fn run_join_test(
         // compare
         let smj_formatted = pretty_format_batches(&smj_collected).unwrap().to_string();
         let hj_formatted = pretty_format_batches(&hj_collected).unwrap().to_string();
-
         let mut smj_formatted_sorted: Vec<&str> = smj_formatted.trim().lines().collect();
         smj_formatted_sorted.sort_unstable();
 
