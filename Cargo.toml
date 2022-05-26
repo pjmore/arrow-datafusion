@@ -37,4 +37,5 @@ exclude = ["ballista-cli", "datafusion-cli"]
 
 [profile.release]
 codegen-units = 1
-lto ="thin"
+lto = true
+debug=2

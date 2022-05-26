@@ -33,12 +33,12 @@ use datafusion::physical_plan::sort_merge_join::SortMergeJoinExec;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
 use fuzz_utils::add_empty_batches;
-
+const JOIN_BATCH_COUNT: usize = 1000;
 #[tokio::test]
 async fn test_inner_join_1k() {
     run_join_test(
-        make_staggered_batches(1000),
-        make_staggered_batches(1000),
+        make_staggered_batches(JOIN_BATCH_COUNT),
+        make_staggered_batches(JOIN_BATCH_COUNT),
         JoinType::Inner,
     )
     .await
@@ -47,8 +47,8 @@ async fn test_inner_join_1k() {
 #[tokio::test]
 async fn test_left_join_1k() {
     run_join_test(
-        make_staggered_batches(1000),
-        make_staggered_batches(1000),
+        make_staggered_batches(JOIN_BATCH_COUNT),
+        make_staggered_batches(JOIN_BATCH_COUNT),
         JoinType::Left,
     )
     .await
@@ -57,8 +57,8 @@ async fn test_left_join_1k() {
 #[tokio::test]
 async fn test_right_join_1k() {
     run_join_test(
-        make_staggered_batches(1000),
-        make_staggered_batches(1000),
+        make_staggered_batches(JOIN_BATCH_COUNT),
+        make_staggered_batches(JOIN_BATCH_COUNT),
         JoinType::Right,
     )
     .await
@@ -67,8 +67,8 @@ async fn test_right_join_1k() {
 #[tokio::test]
 async fn test_full_join_1k() {
     run_join_test(
-        make_staggered_batches(1000),
-        make_staggered_batches(1000),
+        make_staggered_batches(JOIN_BATCH_COUNT),
+        make_staggered_batches(JOIN_BATCH_COUNT),
         JoinType::Full,
     )
     .await
@@ -77,8 +77,8 @@ async fn test_full_join_1k() {
 #[tokio::test]
 async fn test_semi_join_1k() {
     run_join_test(
-        make_staggered_batches(1000),
-        make_staggered_batches(1000),
+        make_staggered_batches(JOIN_BATCH_COUNT),
+        make_staggered_batches(JOIN_BATCH_COUNT),
         JoinType::Semi,
     )
     .await
@@ -87,8 +87,8 @@ async fn test_semi_join_1k() {
 #[tokio::test]
 async fn test_anti_join_1k() {
     run_join_test(
-        make_staggered_batches(1000),
-        make_staggered_batches(1000),
+        make_staggered_batches(JOIN_BATCH_COUNT),
+        make_staggered_batches(JOIN_BATCH_COUNT),
         JoinType::Anti,
     )
     .await
@@ -103,7 +103,7 @@ async fn run_join_test(
 ) {
     let batch_sizes = [1, 2, 7, 49, 50, 51, 100];
     for batch_size in batch_sizes {
-        let session_config = SessionConfig::new().with_batch_size(batch_size);
+        let session_config = SessionConfig::new().with_batch_size(batch_size).with_target_partitions(12);
         let ctx = SessionContext::with_config(session_config);
         let task_ctx = ctx.task_ctx();
 

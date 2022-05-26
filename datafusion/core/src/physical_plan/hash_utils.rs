@@ -188,14 +188,14 @@ macro_rules! declare_hash_array{
 
 
 //Primitive types we know how to hash since ownership and mapping from arrow is straight forward.
-declare_hash_array!(DECLARE: hash_uint8_array_chunk, UInt8Array, u8, 16);
-declare_hash_array!(DECLARE: hash_uint16_array_chunk, UInt16Array, u16, 16);
-declare_hash_array!(DECLARE: hash_uint32_array_chunk, UInt32Array, u32, 16);
-declare_hash_array!(DECLARE: hash_uint64_array_chunk, UInt64Array, u64, 16);
-declare_hash_array!(DECLARE: hash_int8_array_chunk, Int8Array, i8, 16);
-declare_hash_array!(DECLARE: hash_int16_array_chunk, Int16Array, i16, 16);
-declare_hash_array!(DECLARE: hash_int32_array_chunk, Int32Array, i32, 16);
-declare_hash_array!(DECLARE: hash_int64_array_chunk, Int64Array, i64, 16);
+declare_hash_array!(DECLARE: hash_uint8_array_chunk, UInt8Array, u8, 32);
+declare_hash_array!(DECLARE: hash_uint16_array_chunk, UInt16Array, u16, 32);
+declare_hash_array!(DECLARE: hash_uint32_array_chunk, UInt32Array, u32, 32);
+declare_hash_array!(DECLARE: hash_uint64_array_chunk, UInt64Array, u64, 32);
+declare_hash_array!(DECLARE: hash_int8_array_chunk, Int8Array, i8, 32);
+declare_hash_array!(DECLARE: hash_int16_array_chunk, Int16Array, i16, 32);
+declare_hash_array!(DECLARE: hash_int32_array_chunk, Int32Array, i32, 32);
+declare_hash_array!(DECLARE: hash_int64_array_chunk, Int64Array, i64, 32);
 declare_hash_array!(DECLARE: hash_date32_array_chunk, Date32Array, i32, 16);
 declare_hash_array!(DECLARE: hash_date64_array_chunk, Date64Array, i64, 16);
 declare_hash_array!(DECLARE: hash_time_s_array_chunk, TimestampSecondArray, i64, 16);
@@ -331,11 +331,6 @@ pub (crate) fn create_hashes_chunked<const N: usize>(arrays: &[ArrayRef], random
 #[cfg(not(feature="force_hash_collisions"))]
 pub (crate) fn create_hashes_chunked<const N: usize, const FULL_RUN: bool>(arrays: &[ArrayRef], random_state: &RandomState, hashes_buffer: &mut[u64; N], dictionary_hash_cache:&mut[Vec<u64>], start_idx: u32, num_to_process: u32)->Result<()>{
     assert!(dictionary_hash_cache.len() == arrays.len());
-    let num_to_process = if FULL_RUN{
-        N as u32
-    }else{
-        num_to_process
-    };
     if arrays.len() == 1{
         hash_column_chunk::<N, true, false, FULL_RUN>(&arrays[0], random_state, hashes_buffer, &mut dictionary_hash_cache[0], start_idx, num_to_process)?;
     }else{
