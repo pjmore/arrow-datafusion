@@ -1167,12 +1167,11 @@ match as_array {
 
 
 macro_rules! declare_equal_rows_check{
-    (DECLARE_CUSTOM_GET_VAL: $fn_name:ident,$array_type:ident, $get_value:ident, $internal_buffer_size:literal, $proc_size:literal)=>{
+    (DECLARE_CUSTOM_GET_VAL: $fn_name:ident,$array_type:ident, $elem_ty: ty, $get_value:ident, $internal_buffer_size:literal)=>{
         #[allow(unused_unsafe)]
         /// SAFETY: left_indexes must only contain indexes which are in bounds for l. right_indexes must only contain indexes which are within bounds for r. 
         unsafe fn $fn_name<const N: usize, const FIRST_COL: bool, const NULL_EQ_NULL: bool, const LEFT_HAS_NULLS:bool, const RIGHT_HAS_NULLS: bool, const FULL_RUN: bool>(matches: &mut [bool; N], left_indexes: &[u64; N], right_indexes: &[u32; N], l: &dyn Array, r:  &dyn Array, num_to_process: u32){
             const INTERNAL_BUFFER_SIZE: usize = $internal_buffer_size;
-            const BUFFER_PROC_SIZE: usize = $proc_size;
             let l = l.as_any().downcast_ref::<$array_type>().unwrap();
             let r = r.as_any().downcast_ref::<$array_type>().unwrap();
             let num_to_process = if FULL_RUN{
@@ -1180,133 +1179,193 @@ macro_rules! declare_equal_rows_check{
             }else{
                 num_to_process as usize
             };
-            let mut mchunks = (&mut matches[..num_to_process ]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
+
             let mut lchunks = left_indexes[..num_to_process].chunks_exact(INTERNAL_BUFFER_SIZE);
             let mut rchunks = right_indexes[..num_to_process].chunks_exact(INTERNAL_BUFFER_SIZE);
             
 
-            let mut lvalues = [Default::default(); N];
-            let mut rvalues = [Default::default(); N];
+            let mut lvalues: [$elem_ty; N] = [Default::default(); N];
+            let mut rvalues: [$elem_ty; N] = [Default::default(); N];
             let mut left_is_null = [false; N];
             let mut right_is_null = [false; N];
 
-            let mut lvalue_chunks = (&mut lvalues[..num_to_process]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
-            let mut rvalue_chunks = (&mut lvalues[..num_to_process]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
+            
+            let mut rvalue_chunks = (&mut rvalues[..num_to_process]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
             let mut lnull =  (&mut left_is_null[..num_to_process]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
-            let rnull = (&mut right_is_null[..num_to_process]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
+            let mut rnull = (&mut right_is_null[..num_to_process]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
             //use prefetch::prefetch::{Read,High,Data, prefetch};
-            use std::hint::unreachable_unchecked;
 
             let values_ptr = l.values().as_ptr();
-            //let nullability_ptr = l.data_ref().null_buffer().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
-                
-            for (mchunk, (lchunk, rchunk)) in (&mut mchunks).zip((&mut lchunks).zip(&mut rchunks)){
-                for i in 0..INTERNAL_BUFFER_SIZE{
-                    let lidx = lchunk[i] as usize;
-                    prefetch(unsafe{values_ptr.offset(lidx as isize)});
-                    //prefetch::<Read, High, Data, _>(unsafe{values_ptr.offset(lidx as isize)});
-                    //if LEFT_HAS_NULLS {
-                    //    prefetch_null_buffer(nullability_ptr, lidx);
-                    //}
-                }
 
+            //Load the values in the right side of the join into the local buffer
+            //(rchunk, (rvalchunk, rnullchunk))
+            //(&[u32], ((&mut [u8], &mut [bool]), &[u64]))
+            for (rchunk, ((rvalchunk, rnullchunk), lchunk)) in (&mut rchunks).zip((&mut rvalue_chunks).zip(&mut rnull).zip(&mut lchunks)){
+                for i in 0..INTERNAL_BUFFER_SIZE{
+                    let lidx = lchunk[i];
+                    prefetch(unsafe{values_ptr.offset(lidx as isize)});
+                    let ridx = rchunk[i] as usize;
+                    let rvalue = r.value_unchecked(ridx);
+                    let is_null = if RIGHT_HAS_NULLS{
+                        r.is_null(ridx)
+                    }else{
+                        false
+                    };
+                    rvalchunk[i] = rvalue;
+                    if RIGHT_HAS_NULLS{
+                        rnullchunk[i] = is_null;
+                    }
+                }
+            }
+
+
+            let rremain = rchunks.remainder();
+            let rvalremain = rvalue_chunks.into_remainder();
+            let risnullremain = rnull.into_remainder();
+            for (ridx, (rval, risnull)) in  rremain.iter().copied().zip(rvalremain.iter_mut().zip(risnullremain)){
+                let rvalue = r.value_unchecked(ridx as usize);
+                let is_null = if LEFT_HAS_NULLS{
+                    r.is_null(ridx as usize)
+                }else{
+                    false
+                };
+                *rval = rvalue;
+                if LEFT_HAS_NULLS{
+                    *risnull = is_null;
+                } 
+            }
+            let mut lchunks = left_indexes[..num_to_process].chunks_exact(INTERNAL_BUFFER_SIZE);
+            let mut lvalue_chunks = (&mut lvalues[..num_to_process]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
+            //Load the values in the left side of the join into the local buffer
+            let mut offset = 0;
+            for (lchunk, (lvalchunk, lnullchunk)) in (&mut lchunks).zip((&mut lvalue_chunks).zip(&mut lnull)){
                 for i in 0..INTERNAL_BUFFER_SIZE{
                     let lidx = lchunk[i] as usize;
-                    let ridx = rchunk[i] as usize;
-                    if lidx >= l.len(){
-                        unreachable_unchecked();
-                    }
-                    if ridx >= r.len(){
-                        unreachable_unchecked();
-                    }
                     let lvalue = l.value_unchecked(lidx);
-                    let rvalue = r.value_unchecked(ridx);
-                    
+                    let ofst = offset + i;
                     let left_is_null = if LEFT_HAS_NULLS{
                         l.is_null(lidx)
                     }else{
                         false
                     };
-                    
-                    let right_is_null = if RIGHT_HAS_NULLS{
-                        r.is_null(ridx)
+                    lvalchunk[i] = lvalue;
+                    if LEFT_HAS_NULLS{
+                        lnullchunk[i] = left_is_null;
+                    }
+                }
+                offset += INTERNAL_BUFFER_SIZE;
+            }
+            let lremain = lchunks.remainder();
+            let lvalremain = lvalue_chunks.into_remainder();
+            let lisnullremain = lnull.into_remainder();
+            for (lidx, (lval, lisnull)) in  lremain.iter().copied().zip(lvalremain.iter_mut().zip(lisnullremain.iter_mut())){
+                let lvalue = l.value_unchecked(lidx as usize);
+                let is_null = if LEFT_HAS_NULLS{
+                    l.is_null(lidx as usize)
+                }else{
+                    false
+                };
+                *lval = lvalue;
+                if LEFT_HAS_NULLS{
+                    *lisnull = is_null;
+                } 
+            }
+
+            //Now that all values are loaded into the internal buffers, check equality and process
+            let mut mchunks = (&mut matches[..num_to_process ]).chunks_exact_mut(INTERNAL_BUFFER_SIZE);
+            let mut lvalue_chunks = lvalues[..num_to_process].chunks_exact(INTERNAL_BUFFER_SIZE);
+            let mut rvalue_chunks = rvalues[..num_to_process].chunks_exact(INTERNAL_BUFFER_SIZE);
+            let mut lnull =   left_is_null[..num_to_process].chunks_exact(INTERNAL_BUFFER_SIZE);
+            let mut rnull = right_is_null[..num_to_process].chunks_exact(INTERNAL_BUFFER_SIZE);
+            
+            
+            for (mchunk, ((lvalchunk, lnullchunk), (rvalchunk, rnullchunk))) in (&mut mchunks).zip(
+                (&mut lvalue_chunks).zip(&mut lnull).zip(
+                    (&mut rvalue_chunks).zip(&mut rnull)
+                )
+            ){  
+                for i in 0..INTERNAL_BUFFER_SIZE{
+                    let values_eq = lvalchunk[i] == rvalchunk[i];
+                    let lnull = if LEFT_HAS_NULLS {
+                        lnullchunk[i]
                     }else{
                         false
                     };
-                    let values_eq = lvalue == rvalue;
-                    let non_null_eq = !left_is_null && !right_is_null && values_eq;
-                    let values_match = if NULL_EQ_NULL{
-                        (left_is_null && right_is_null) || non_null_eq
+                    let rnull = if RIGHT_HAS_NULLS {
+                        rnullchunk[i]
                     }else{
-                        non_null_eq
+                        false
+                    };
+                    let eq = if NULL_EQ_NULL{
+                        (lnull && rnull) || (!lnull && !rnull && values_eq)
+                    }else{
+                        (!lnull && !rnull) && values_eq
                     };
                     mchunk[i] = if FIRST_COL{
-                        values_match
+                        eq
                     }else{
-                        mchunk[i] && values_match
+                        mchunk[i] && eq
                     };
-
                 }
             }
             let mremain = mchunks.into_remainder();
-            let lremain = lchunks.remainder();
-            let rremain = rchunks.remainder();
-            
-            for i in 0..mremain.len(){
-                let lidx = lremain[i] as usize;
-                let ridx = rremain[i] as usize;
-                let lvalue = l.value_unchecked(lidx);
-                let rvalue = r.value_unchecked(ridx);
-                
-                let left_is_null = if LEFT_HAS_NULLS{
-                    l.is_null(lidx)
+            let lvalremain = lvalue_chunks.remainder();
+            let rvalremain = rvalue_chunks.remainder();
+            let rnullremain = rnull.remainder();
+            let lnullremain = lnull.remainder();
+            for (is_match, ((lvalue, lnull), (rvalue, rnull))) in mremain.iter_mut().zip(
+                    lvalremain.iter().zip(lnullremain.iter()).zip(
+                    rvalremain.iter().zip(rnullremain.iter())
+                )
+            ){
+                let values_eq = *lvalue == *rvalue;
+                let lnull = if LEFT_HAS_NULLS {
+                    *lnull
                 }else{
                     false
                 };
-                let right_is_null = if RIGHT_HAS_NULLS{
-                    r.is_null(ridx)
+                let rnull = if RIGHT_HAS_NULLS {
+                    *rnull
                 }else{
                     false
                 };
-                let values_eq = lvalue == rvalue;
-                    let non_null_eq = !left_is_null && !right_is_null && values_eq;
-                let values_match = if NULL_EQ_NULL{
-                    (left_is_null && left_is_null) || non_null_eq
+                let eq = if NULL_EQ_NULL{
+                    (lnull && rnull) || (!lnull && !rnull && values_eq)
                 }else{
-                    non_null_eq
+                    (!lnull && !rnull && values_eq)
                 };
-                mremain[i]= if FIRST_COL {
-                    values_match
-                }else {
-                    mremain[i] && values_match
-                }; 
-            }  
+                *is_match = if FIRST_COL{
+                    eq
+                }else{
+                    *is_match && eq
+                };
+            }            
         }        
             
     };
 
-    (DECLARE: $fn_name:ident, $array_type:ident, $internal_buffer_size:literal, $proc_size:literal)=>{
-        declare_equal_rows_check!(DECLARE_CUSTOM_GET_VAL: $fn_name, $array_type, value_unchecked, $internal_buffer_size, $proc_size);
+    (DECLARE: $fn_name:ident, $array_type:ident, $elem_ty: ty, $internal_buffer_size:literal, $proc_size:literal)=>{
+        declare_equal_rows_check!(DECLARE_CUSTOM_GET_VAL: $fn_name, $array_type,$elem_ty, value_unchecked, $internal_buffer_size);
     }
 }
 //Keep the number of prefetches low even though simd can process mor than 64 u8 elements at once
-declare_equal_rows_check!(DECLARE: check_equal_rows_uint8, UInt8Array, 16, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_uint16, UInt16Array, 16, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_uint32, UInt32Array, 16, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_uint64, UInt64Array, 16, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_int8, Int8Array, 16, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_int16, Int16Array, 16, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_int32, Int32Array, 16, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_int64, Int64Array, 8, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_float32, Float32Array, 32, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_float64, Float64Array, 32, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_bool, BooleanArray, 32, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_date32, Date32Array, 32, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_date64, Date64Array, 32, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_time_s, TimestampSecondArray, 32, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_time_ms, TimestampMillisecondArray, 32, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_time_us, TimestampMicrosecondArray, 32, 4);
-declare_equal_rows_check!(DECLARE: check_equal_rows_time_ns, TimestampNanosecondArray, 32, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_uint8, UInt8Array,u8, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_uint16, UInt16Array,u16, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_uint32, UInt32Array,u32, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_uint64, UInt64Array,u64, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_int8, Int8Array,i8, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_int16, Int16Array,i16, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_int32, Int32Array,i32, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_int64, Int64Array, i64,8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_float32, Float32Array,f32, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_float64, Float64Array,f64, 8, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_bool, BooleanArray,bool, 32, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_date32, Date32Array,i32, 32, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_date64, Date64Array,i64, 32, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_time_s, TimestampSecondArray, i64, 32, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_time_ms, TimestampMillisecondArray, i64, 32, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_time_us, TimestampMicrosecondArray, i64, 32, 4);
+declare_equal_rows_check!(DECLARE: check_equal_rows_time_ns, TimestampNanosecondArray, i64, 32, 4);
 
 //declare_equal_rows_check!(DECLARE: check_equal_rows_utf8, StringArray, 64);
 //declare_equal_rows_check!(DECLARE: check_equal_rows_largeutf8, LargeStringArray, 64);
